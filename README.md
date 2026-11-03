@@ -1,3 +1,5 @@
+# NOEMA CPU Reasoning Platform v0.10.0
+
 CPU Reasoning Platform v0.10.0
 New: general local reasoning preview
 The new /v1/ask endpoint supports explanation, coding, logic, science, math, and factual Q&A through the existing CPU-hosted LLM. The model-generated answers are not independently verified. Formal propositional entailment has a separate exact /v1/verify-logic endpoint. The original v0.9.1 arithmetic, benchmarks, frozen-dataset safeguards, API, durable jobs, and tests are retained.
