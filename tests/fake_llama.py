@@ -63,11 +63,15 @@ def _constrained(steps, wrong_op=False):
 class FakeLlama:
     def __init__(self, model_id: str, accuracy: float, delay_s: float = 0.0, think: bool = False,
                  honour_grammar: bool = True, think_capable: bool = True, model_path: str | None = None,
-                 api_key: str | None = None):
+                 api_key: str | None = None, n_ctx: int = 4096, extra_models: tuple[str, ...] = (),
+                 serve_props: bool | None = None):
         self.model_id, self.accuracy, self.delay_s, self.think = model_id, accuracy, delay_s, think
         self.honour_grammar, self.think_capable = honour_grammar, think_capable
         self.model_path = model_path
         self.api_key = api_key  # like llama-server --api-key: /health stays public
+        self.n_ctx, self.extra_models = n_ctx, tuple(extra_models)
+        # Default: /props only when a model_path is given (older tests rely on the 404).
+        self.serve_props = serve_props
         self.requests: list[dict] = []
         fake = self
 
@@ -95,14 +99,14 @@ class FakeLlama:
                 if not self._authorized():
                     return
                 if self.path == "/v1/models":
-                    return self._json(200, {"data": [{"id": fake.model_id}]})
+                    return self._json(200, {"data": [{"id": m} for m in (fake.model_id, *fake.extra_models)]})
                 if self.path == "/health":
                     return self._json(200, {"status": "ok"})
-                if self.path == "/props" and fake.model_path:
+                if self.path == "/props" and (fake.model_path if fake.serve_props is None else fake.serve_props):
                     return self._json(200, {"model_path": fake.model_path, "build_info": "b9999-fake",
                                             "model_ftype": "Q8_0", "chat_template": "{{fake}}",
                                             "total_slots": 1,
-                                            "default_generation_settings": {"n_ctx": 4096}})
+                                            "default_generation_settings": {"n_ctx": fake.n_ctx}})
                 self._json(404, {})
 
             def do_POST(self):
@@ -115,7 +119,7 @@ class FakeLlama:
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_port}"
-        Thread(target=self.httpd.serve_forever, daemon=True).start()
+        Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
 
     def complete(self, body: dict) -> dict:
         system, user = body["messages"][0]["content"], body["messages"][1]["content"]

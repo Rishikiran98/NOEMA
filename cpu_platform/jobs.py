@@ -14,7 +14,7 @@ from threading import Condition, RLock, Thread
 import time
 from uuid import uuid4
 
-from .engine import UpstreamUnavailable
+from .engine import UpstreamFailed, UpstreamUnavailable
 
 
 class JobFault(Exception):
@@ -305,6 +305,8 @@ class JobWorkers:
             self._finish(job_id, result, state=state)
         except UpstreamUnavailable:
             self._finish(job_id, state="failed", error="local_model_unavailable")
+        except UpstreamFailed as exc:
+            self._finish(job_id, state="failed", error=exc.code)
         except ValueError:
             self._finish(job_id, state="rejected", error="invalid_request")
         except Exception:

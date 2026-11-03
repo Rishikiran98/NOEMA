@@ -89,3 +89,38 @@ measured. "Needs" = file + f16 KV cache (per-model layer/head shape) + 0.5 GB bu
 reserve reflects that the OS and API need a roughly constant amount; it lets the 30B coder
 (~20.6 GB) run on a 32 GB laptop (~22 GB budget), with about 10 GB left for everything else.
 Close other large programs before launching it.
+
+## Checking the loaded model before serving (M1.4)
+
+The API can refuse to serve unless llama.cpp has loaded what you expect:
+
+```powershell
+py -m cpu_platform.server --expect-model qwen3-coder-30b-a3b
+```
+
+`--expect-model` takes a preset name (checks the repository name and quantization in the
+model id or file name, the preset's context size, and its thinking support) or
+comma-separated name fragments (`--expect-model "mistral,Q5_K_M"`). Add `--min-ctx N` to
+require a context size and `--expect-sha256 HEX` to require the exact GGUF file (hashed from
+the path llama.cpp reports, so the API must be able to read it). Anything the check needs
+but the server does not report (for example `n_ctx` on a build without `/props`) counts as a
+**failure**, not a pass. If several models are listed, that is a failure too.
+
+At start-up a mismatch stops the API with every problem listed, e.g.
+`server context 4096 is below the expected 16384; relaunch with --ctx-size 16384`. If the model
+server is still loading, the API starts and checks on first use; until it passes, every model
+request gets `503 local_model_mismatch` and `/readyz` lists the problems.
+
+### Model-server errors
+
+| Cause | Client error | API response | Retry? |
+|---|---|---|---|
+| connection refused/reset, timeout, HTTP 5xx | `ModelTransportError` | `503 local_model_unavailable` | yes |
+| HTTP 4xx (bad key, prompt too long) | `ModelRejectedRequest` | `502 local_model_rejected_request` | no |
+| invalid JSON / missing `choices[0].message` | `ModelProtocolError` | `502 local_model_bad_response` | no |
+| wrong model, context or hash | `ModelMismatch` | `503 local_model_mismatch` | no |
+| `thinking: true` for a model that cannot think | `ValueError` | `400 invalid_request` | no |
+| a bug in NOEMA | (not wrapped) | `500 internal_error` | no |
+
+Before M1.4 every one of these, bugs included, came back as `503 local_model_unavailable`
+with `retryable: true`. All client errors still subclass `RuntimeError`.

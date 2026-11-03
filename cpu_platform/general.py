@@ -11,7 +11,8 @@ from time import perf_counter
 
 from cpu_first.core import exact_arithmetic, formatted_fraction, InvalidExpression
 from .cot_check import audit_reasoning
-from .engine import ReasoningEngine, UpstreamUnavailable
+from cpu_first.core import ModelError
+from .engine import PASS_THROUGH, ReasoningEngine, UpstreamUnavailable, upstream_error
 
 DOMAINS = ("auto", "general", "math", "logic", "code", "science", "factual")
 STRATEGIES = ("direct", "check_and_revise")
@@ -119,10 +120,10 @@ class GeneralReasoner:
                 result = self.model.chat(current_prompt, current_question,
                                          max_tokens=self.max_output_tokens, temperature=0.0,
                                          thinking=thinking, reasoning_budget=think_budget if thinking else None)
-            except UpstreamUnavailable:
+            except PASS_THROUGH:
                 raise
-            except Exception as exc:
-                raise UpstreamUnavailable("Local model inference failed") from exc
+            except ModelError as exc:
+                raise upstream_error(exc) from exc
             model_calls += 1
             prompt_tokens += result.prompt_tokens or 0
             completion_tokens += result.completion_tokens or 0
