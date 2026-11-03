@@ -6,10 +6,22 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 import json
+import os
 import re
 import time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+
+
+# Optional shared secret for the local llama.cpp server. llama-server reads the same
+# variable natively (it is the env form of --api-key), so the key never appears on a
+# command line, in a launch manifest or in a log. Unset = no auth (loopback only).
+LLAMA_API_KEY_ENV = "LLAMA_API_KEY"
+
+
+def model_server_headers() -> dict[str, str]:
+    key = os.environ.get(LLAMA_API_KEY_ENV, "")
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 class InvalidExpression(ValueError):
@@ -177,7 +189,8 @@ class LocalLlama:
         self.model = available[0]["id"]
 
     def _get(self, endpoint: str) -> dict:
-        with urlopen(self.base_url + endpoint, timeout=15) as response:
+        with urlopen(Request(self.base_url + endpoint, headers=model_server_headers()),
+                     timeout=15) as response:
             return json.load(response)
 
     @property
@@ -222,7 +235,7 @@ class LocalLlama:
         request = Request(
             self.base_url + "/v1/chat/completions",
             data=json.dumps(request_body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **model_server_headers()},
             method="POST",
         )
         start = time.perf_counter()

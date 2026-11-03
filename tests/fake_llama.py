@@ -62,10 +62,12 @@ def _constrained(steps, wrong_op=False):
 
 class FakeLlama:
     def __init__(self, model_id: str, accuracy: float, delay_s: float = 0.0, think: bool = False,
-                 honour_grammar: bool = True, think_capable: bool = True, model_path: str | None = None):
+                 honour_grammar: bool = True, think_capable: bool = True, model_path: str | None = None,
+                 api_key: str | None = None):
         self.model_id, self.accuracy, self.delay_s, self.think = model_id, accuracy, delay_s, think
         self.honour_grammar, self.think_capable = honour_grammar, think_capable
         self.model_path = model_path
+        self.api_key = api_key  # like llama-server --api-key: /health stays public
         self.requests: list[dict] = []
         fake = self
 
@@ -81,7 +83,17 @@ class FakeLlama:
                 self.end_headers()
                 self.wfile.write(blob)
 
+            def _authorized(self):
+                if fake.api_key is None or self.path == "/health":
+                    return True
+                if self.headers.get("Authorization") == f"Bearer {fake.api_key}":
+                    return True
+                self._json(401, {"error": {"code": 401, "message": "Invalid API Key"}})
+                return False
+
             def do_GET(self):
+                if not self._authorized():
+                    return
                 if self.path == "/v1/models":
                     return self._json(200, {"data": [{"id": fake.model_id}]})
                 if self.path == "/health":
@@ -94,6 +106,8 @@ class FakeLlama:
                 self._json(404, {})
 
             def do_POST(self):
+                if not self._authorized():
+                    return
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 fake.requests.append(body)
                 time.sleep(fake.delay_s)
