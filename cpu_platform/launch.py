@@ -28,9 +28,9 @@ import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from cpu_first.core import LLAMA_API_KEY_ENV
+from cpu_first.core import LLAMA_API_KEY_ENV, hybrid_thinking
 
-from .hardware import GB, MODEL_PRESETS, detect, model_fits
+from .hardware import GB, MODEL_PRESETS, detect, model_fits, model_memory_bytes, ram_budget
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -102,8 +102,13 @@ def supports(help_text: str, flag: str) -> bool:
 
 def build_command(prefix: list[str], help_text: str, *, model_source: tuple[str, str],
                   port: int, threads: int, ctx_size: int, allow_gpu: bool,
-                  is_qwen3: bool) -> tuple[list[str], list[str]]:
-    """Return (argv, notes). Optional flags are added only when this build lists them."""
+                  is_qwen3: bool, thinking: bool | None = None) -> tuple[list[str], list[str]]:
+    """Return (argv, notes). Optional flags are added only when this build lists them.
+
+    is_qwen3 enables the Jinja chat template; thinking (default: is_qwen3) additionally
+    enables per-request reasoning. Non-thinking Qwen3 models (Qwen3-Coder) get only --jinja.
+    """
+    thinking = is_qwen3 if thinking is None else thinking
     kind, value = model_source
     cmd = list(prefix)
     cmd += (["--hf-repo", value] if kind == "hf" else ["--model", value])
@@ -120,12 +125,12 @@ def build_command(prefix: list[str], help_text: str, *, model_source: tuple[str,
             cmd += ["--device", "none"]
         else:
             notes.append("This llama.cpp build has no --device flag; relying on env hiding and log checks.")
-    if is_qwen3:
+    if is_qwen3 and supports(help_text, "--jinja"):
+        cmd += ["--jinja"]
+    if thinking:
         # v0.8: thinking is decided PER REQUEST (chat_template_kwargs.enable_thinking, plus a
         # per-request reasoning_budget_tokens), so the server must not force it off. Older
         # launchers passed '--reasoning off'; the client still sends /no_think as a fallback.
-        if supports(help_text, "--jinja"):
-            cmd += ["--jinja"]
         if supports(help_text, "--reasoning"):
             cmd += ["--reasoning", "auto"]
         elif not supports(help_text, "--reasoning-budget"):
@@ -201,11 +206,22 @@ def main(argv: list[str] | None = None) -> int:
     total_ram = hw["memory"]["total_bytes"]
 
     if args.list_models:
+        print(f"{'preset':20s} {'role':7s} {'params':>16s} {'file':>8s} {'ctx':>6s} {'needs':>8s} "
+              f"thinking  fit")
         for p in MODEL_PRESETS.values():
-            fit = "fits" if model_fits(p, total_ram, rec["ctx_size"]) else "too large for this RAM"
+            ctx = p.ctx_size or rec["ctx_size"]
+            fit = "fits" if model_fits(p, total_ram, ctx) else "too large for this RAM"
             est = (rec["token_rate_estimate_per_s"] or {}).get(p.name)
-            print(f"{p.name:12s} {p.hf:32s} ~{p.gb:5.2f} GB  {fit}"
-                  + (f"  ~{est} tok/s est." if est else ""))
+            params = f"{p.params_b}B" + (f" ({p.active_params_b}B act)" if p.active_params_b else "")
+            need = model_memory_bytes(p, ctx) / GB
+            print(f"{p.name:20s} {p.role:7s} {params:>16s} {p.gb:6.2f}GB {ctx:6d} {need:6.1f}GB "
+                  f"{'yes' if p.thinking else 'no':8s}  {fit}"
+                  + (f"  ~{est} tok/s est." if est else "")
+                  + (f"  [{p.note}]" if p.note else ""))
+            print(f"{'':20s} {p.hf}")
+        if total_ram:
+            print(f"\nRAM budget for the model server: {ram_budget(total_ram) / GB:.1f} GB "
+                  f"(max of 60% of RAM and RAM minus 10 GB).")
         print(f"\nDetected: {hw['cpu']['physical_cores']} physical cores, {hw['memory']['total_gb']} GB RAM,"
               f" GPUs: {', '.join(g['name'] for g in hw['gpus']) or 'none'}")
         return 0
@@ -220,19 +236,23 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"model file not found: {args.model_file}")
         model_source, label = ("file", str(Path(args.model_file).resolve())), Path(args.model_file).name
         size = Path(args.model_file).stat().st_size
-        if total_ram and size + GB > 0.6 * total_ram and not args.force:
-            parser.error("model file is too large for 60% of RAM; use --force to override")
+        if total_ram and size + GB > ram_budget(total_ram) and not args.force:
+            parser.error("model file is too large for this machine's RAM budget; use --force to override")
     elif args.hf:
         model_source, label = ("hf", args.hf), args.hf
     else:
         preset = MODEL_PRESETS.get(args.model)
         if preset is None:
             parser.error(f"unknown preset {args.model!r}; choose from {', '.join(MODEL_PRESETS)}")
+        ctx_size = args.ctx_size or preset.ctx_size or rec["ctx_size"]
         if not model_fits(preset, total_ram, ctx_size) and not args.force:
-            parser.error(f"{preset.name} (~{preset.gb} GB) may not fit in this machine's RAM "
-                         f"({hw['memory']['total_gb']} GB); pick a smaller model or pass --force")
+            parser.error(f"{preset.name} (~{preset.gb} GB file, ~{model_memory_bytes(preset, ctx_size) / GB:.1f} GB "
+                         f"with a {ctx_size}-token context) may not fit in this machine's RAM "
+                         f"({hw['memory']['total_gb']} GB); pick a smaller model, a smaller --ctx-size, "
+                         f"or pass --force")
         model_source, label = ("hf", preset.hf), preset.name
     is_qwen3 = "qwen3" in label.lower()
+    thinking = preset.thinking if preset else hybrid_thinking(label)
 
     prefix = find_llama(args.llama_bin)
     if prefix is None:
@@ -245,10 +265,10 @@ def main(argv: list[str] | None = None) -> int:
     help_text = server_help(prefix) if Path(prefix[0]).is_file() else ""
     cmd, notes = build_command(prefix, help_text, model_source=model_source, port=args.port,
                                threads=threads, ctx_size=ctx_size, allow_gpu=args.allow_gpu,
-                               is_qwen3=is_qwen3)
+                               is_qwen3=is_qwen3, thinking=thinking)
     if not help_text:
         notes = ["llama.cpp not found or --help unreadable: build-dependent flags "
-                 "(--device none, --reasoning off, --threads-batch, --parallel) are omitted here."]
+                 "(--device none, --jinja, --reasoning, --threads-batch, --parallel) are omitted here."]
     env_overrides = {} if args.allow_gpu else dict(GPU_HIDING_ENV)
     results = Path(args.results_dir)
     log_path = results / f"llama_server_{args.port}.log"
@@ -258,7 +278,11 @@ def main(argv: list[str] | None = None) -> int:
         "model": {"label": label, "source": model_source[0], "value": model_source[1],
                   "preset": preset.name if preset else None,
                   "params_b": preset.params_b if preset else None,
-                  "approx_bytes": preset.approx_bytes if preset else None},
+                  "approx_bytes": preset.approx_bytes if preset else None,
+                  "role": preset.role if preset else None,
+                  "active_params_b": preset.active_params_b if preset else None,
+                  "hybrid_thinking": thinking,
+                  "estimated_memory_bytes": model_memory_bytes(preset, ctx_size) if preset else None},
         "llama_cpp": {"argv": cmd, "version": server_version(prefix) if help_text else None,
                       "port": args.port, "log_file": str(log_path),
                       "api_key": "configured" if os.environ.get(LLAMA_API_KEY_ENV) else "not configured"},
