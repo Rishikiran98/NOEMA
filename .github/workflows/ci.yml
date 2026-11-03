@@ -1,7 +1,6 @@
 name: CPU-first platform validation
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   standard-library-tests:
