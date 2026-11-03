@@ -72,6 +72,7 @@ numbers, line counts or test counts.
 | `cpu_first/core.py` | llama.cpp client (`LocalLlama`), exact arithmetic, thinking/budget controls |
 | `cpu_platform/server.py` | loopback HTTP API (`/v1/reason`, `/v1/ask`, `/v1/verify-*`, `/v1/jobs`) |
 | `cpu_platform/engine.py` | legacy reasoning routes (auto, hybrid, adaptive, proof, semantic) |
+| `cpu_platform/contract.py` | NOEMA Engine request/result contract 1.0 ([docs/engine-contract.md](docs/engine-contract.md)); every new engine route returns an `EngineResult` |
 | `cpu_platform/general.py` | `/v1/ask` general Q&A with evidence accounting |
 | `cpu_platform/search.py`, `cot_check.py` | sampled reasoning, arithmetic checker, policies |
 | `cpu_platform/logic.py` | exact propositional entailment checker |
