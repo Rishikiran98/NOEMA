@@ -27,4 +27,5 @@ jobs:
           python -m cpu_platform.hardware --no-bandwidth
           python -m cpu_platform.launch --model qwen3-0.6b --dry-run
       - name: Mark real-model coverage as NOT RUN
-        run: python -c "print('Real CPU LLM inference: NOT RUN. Job tests use fake models and exact arithmetic.')"
+        run: |
+          python -c "print('Real CPU LLM inference: NOT RUN. Job tests use fake models and exact arithmetic.')"
