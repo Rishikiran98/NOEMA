@@ -9,14 +9,17 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+
+from cpu_first.core import model_server_headers
 
 NOT_RUN = "NOT RUN"
 
 
 def server_props(base_url: str, timeout: float = 10) -> dict | None:
     try:
-        with urlopen(base_url.rstrip("/") + "/props", timeout=timeout) as response:
+        with urlopen(Request(base_url.rstrip("/") + "/props", headers=model_server_headers()),
+                     timeout=timeout) as response:
             return json.load(response)
     except (OSError, ValueError):
         return None

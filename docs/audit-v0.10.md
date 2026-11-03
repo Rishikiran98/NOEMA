@@ -88,4 +88,4 @@ Priority: **P0** blocks any external pilot; **P1** blocks the M4 accuracy gate o
   llama.cpp build is unpinned, G16).
 - The browser playground (`static/index.html`) was not reviewed beyond its CSP header.
 - Windows-specific behaviour (job-store locking via `msvcrt`, PowerShell scripts) was read, not run.
-- Fixes for G1 and G2 are **not** included here; they are M1.5.
+- Fixes for G1 and G2 are **not** part of this audit; they landed separately as M1.5 (see the ROADMAP progress log).

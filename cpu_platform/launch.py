@@ -25,7 +25,10 @@ import shutil
 import subprocess
 import sys
 import time
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+from cpu_first.core import LLAMA_API_KEY_ENV
 
 from .hardware import GB, MODEL_PRESETS, detect, model_fits
 
@@ -155,6 +158,25 @@ def wait_ready(port: int, proc: subprocess.Popen, timeout_s: float) -> bool:
     return False
 
 
+def api_key_status(port: int, key_configured: bool, timeout: float = 5) -> str:
+    """Whether llama.cpp actually demands the key. Records a status, never the key.
+
+    The probe sends an unauthenticated chat request: 401 means the server enforces the key.
+    Anything else while a key is configured means this build ignored LLAMA_API_KEY.
+    """
+    if not key_configured:
+        return "not configured"
+    probe = Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=b"{}",
+                    headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(probe, timeout=timeout):
+            return "NOT ENFORCED"
+    except HTTPError as exc:
+        return "enforced" if exc.code == 401 else "NOT ENFORCED"
+    except OSError:
+        return "NOT CHECKED"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Hardware-aware CPU-only llama.cpp launcher")
     source = parser.add_mutually_exclusive_group()
@@ -238,7 +260,8 @@ def main(argv: list[str] | None = None) -> int:
                   "params_b": preset.params_b if preset else None,
                   "approx_bytes": preset.approx_bytes if preset else None},
         "llama_cpp": {"argv": cmd, "version": server_version(prefix) if help_text else None,
-                      "port": args.port, "log_file": str(log_path)},
+                      "port": args.port, "log_file": str(log_path),
+                      "api_key": "configured" if os.environ.get(LLAMA_API_KEY_ENV) else "not configured"},
         "settings": {"threads": threads, "ctx_size": ctx_size, "parallel_slots": 1},
         "cpu_only": {"requested": not args.allow_gpu, "n_gpu_layers": 0,
                      "device_none_flag": "--device" in cmd and not args.allow_gpu,
@@ -276,7 +299,16 @@ def main(argv: list[str] | None = None) -> int:
         if proc.poll() is None:
             proc.terminate()
         return 1
+    key_status = api_key_status(args.port, bool(os.environ.get(LLAMA_API_KEY_ENV)))
+    manifest["llama_cpp"]["api_key"] = key_status
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Ready. Manifest: {manifest_path}")
+    if key_status == "not configured":
+        print(f"Note: no {LLAMA_API_KEY_ENV} set, so any local process or rebinding web page can use "
+              f"this model server. Set {LLAMA_API_KEY_ENV} in this window AND the client windows to require it.")
+    elif key_status != "enforced":
+        print(f"WARNING: {LLAMA_API_KEY_ENV} is set but the server does not enforce it ({key_status}). "
+              "This llama.cpp build may not read the variable; do not rely on it.", file=sys.stderr)
     if scan["verdict"] == "gpu_visible_or_used" and not args.allow_gpu:
         print("WARNING: the server log shows GPU visibility/use:", *scan["evidence"], sep="\n  ", file=sys.stderr)
         print("This run must not be reported as CPU-only. Use a CPU-only build (scripts/build_cpu_llama.sh).",

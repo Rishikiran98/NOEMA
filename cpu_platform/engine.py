@@ -92,8 +92,10 @@ class LazyLocalModel:
     def ready(self) -> bool:
         try:
             self._get_model()
-            from urllib.request import urlopen
-            with urlopen(self.url + "/v1/models", timeout=2) as response:
+            from urllib.request import Request, urlopen
+            from cpu_first.core import model_server_headers
+            with urlopen(Request(self.url + "/v1/models", headers=model_server_headers()),
+                         timeout=2) as response:
                 return response.status == 200
         except Exception:
             return False

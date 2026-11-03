@@ -9,12 +9,14 @@ import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import json
+import logging
 import os
 import re
 from secrets import token_hex
 from threading import BoundedSemaphore
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlsplit
 
 from .engine import LazyLocalModel, ReasoningEngine, UpstreamUnavailable
 from .proof import verify_plan
@@ -26,6 +28,16 @@ from .jobs import JobStore, JobWorkers, JobFault
 from . import __version__
 
 MAX_BODY_BYTES = 16 * 1024
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+log = logging.getLogger("noema.server")
+
+
+def _hostname(value: str) -> str | None:
+    """Hostname of a Host header value ('localhost:8070', '[::1]:8070'), lowercased."""
+    try:
+        return urlsplit("//" + value.strip()).hostname
+    except ValueError:
+        return None
 
 
 class App(ThreadingHTTPServer):
@@ -37,11 +49,19 @@ class App(ThreadingHTTPServer):
                  api_keys: dict[str, str] | None = None,
                  jobs_db: str | None = None, job_workers: int = 1,
                  max_queued: int = 32, max_per_tenant: int = 8,
-                 job_ttl_hours: int = 24, max_submissions_per_hour: int = 120):
+                 job_ttl_hours: int = 24, max_submissions_per_hour: int = 120,
+                 allowed_hosts: tuple[str, ...] = ()):
         host = address[0]
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("Preview API binds to loopback only; use a TLS reverse proxy for deployment")
         super().__init__(address, Handler)
+        # DNS-rebinding defence: a browser page whose domain re-resolves to 127.0.0.1 still
+        # sends its own name in Host/Origin. Only loopback names, plus hostnames an operator
+        # names explicitly (e.g. the local TLS reverse proxy's), are served.
+        extra = {h.strip().lower() for h in allowed_hosts}
+        if any(not h or not re.fullmatch(r"[a-z0-9.:-]+", h) for h in extra):
+            raise ValueError("allowed_hosts must be plain hostnames")
+        self.allowed_hosts = frozenset(LOOPBACK_HOSTS | extra)
         self.engine = engine
         self.general = GeneralReasoner(engine.model)
         if api_key and api_keys:
@@ -80,6 +100,71 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Do not log request bodies, headers, or question texts.
         pass
+
+    def send_response(self, code, message=None):
+        self._response_started = True
+        super().send_response(code, message)
+
+    def _origin_problem(self) -> str | None:
+        """'forbidden_host' / 'forbidden_origin' when the request names a non-allowed host."""
+        allowed = self.server.allowed_hosts
+        hosts = self.headers.get_all("Host") or []
+        if len(hosts) > 1:
+            return "forbidden_host"
+        # A missing Host (HTTP/1.0 tools) is not a rebinding vector: browsers always send it.
+        if hosts and _hostname(hosts[0]) not in allowed:
+            return "forbidden_host"
+        origins = self.headers.get_all("Origin") or []
+        if len(origins) > 1:
+            return "forbidden_origin"
+        if origins:
+            try:
+                parts = urlsplit(origins[0].strip())
+                ok = parts.scheme in ("http", "https") and parts.hostname in allowed
+            except ValueError:
+                ok = False
+            if not ok:  # includes Origin: null (sandboxed frames, file://)
+                return "forbidden_origin"
+        return None
+
+    def _guarded(self, method: str, handler) -> None:
+        """Run a handler so that every request ends in a JSON response or a closed socket
+        the client caused; never a silently dropped connection."""
+        self._response_started = False
+        problem = self._origin_problem()
+        if problem:
+            self._send(403, {"error": problem})
+            return
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True  # client went away; nothing to answer
+        except Exception:
+            request_id = token_hex(8)
+            # Traceback stays local; request bodies, headers and query strings are not logged.
+            log.exception("internal error %s %s request_id=%s", method,
+                          self.path.split("?", 1)[0][:200], request_id)
+            self.close_connection = True
+            if not self._response_started:
+                try:
+                    self._send(500, {"error": "internal_error", "request_id": request_id,
+                                     "retryable": False})
+                except OSError:
+                    pass
+
+    def do_GET(self):
+        self._guarded("GET", self._get)
+
+    def do_POST(self):
+        self._guarded("POST", self._post)
+
+    def do_DELETE(self):
+        self._guarded("DELETE", self._delete)
+
+    def _method_not_allowed(self):
+        self._guarded(self.command, lambda: self._send(405, {"error": "method_not_allowed"}))
+
+    do_PUT = do_PATCH = do_OPTIONS = _method_not_allowed
 
     def _send(self, code: int, data: dict):
         blob = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -144,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
             raise JobFault("invalid_max_calls", 400)
         return {"question": question, "mode": mode, "max_calls": calls}
 
-    def do_GET(self):
+    def _get(self):
         if self.path in ("/", "/index.html"):
             html_path = Path(__file__).parent / "static" / "index.html"
             blob = html_path.read_bytes()
@@ -182,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, job) if job else self._send(404, {"error": "job_not_found"})
         return self._send(404, {"error": "not_found"})
 
-    def do_DELETE(self):
+    def _delete(self):
         if not self._auth():
             return
         if not self.path.startswith("/v1/jobs/"):
@@ -197,7 +282,7 @@ class Handler(BaseHTTPRequestHandler):
         except JobFault as exc:
             return self._send(exc.http_status, {"error": exc.code})
 
-    def do_POST(self):
+    def _post(self):
         if not self._auth():
             return
         if self.path not in ("/v1/reason", "/v1/verify-plan", "/v1/verify-semantic-plan", "/v1/ask", "/v1/verify-logic", "/v1/jobs"):
@@ -295,14 +380,15 @@ def create_server(port: int = 8070, *, engine: ReasoningEngine | None = None,
                   api_keys: dict[str, str] | None = None,
                   jobs_db: str | None = None, job_workers: int = 1,
                   max_queued: int = 32, max_per_tenant: int = 8,
-                  job_ttl_hours: int = 24, max_submissions_per_hour: int = 120) -> App:
+                  job_ttl_hours: int = 24, max_submissions_per_hour: int = 120,
+                  allowed_hosts: tuple[str, ...] = ()) -> App:
     if max_inflight < 1 or max_inflight > 128:
         raise ValueError("max_inflight must be between 1 and 128")
     engine = engine or ReasoningEngine(LazyLocalModel(model_url))
     return App(("127.0.0.1", port), engine, api_key=api_key, max_inflight=max_inflight,
                api_keys=api_keys, jobs_db=jobs_db, job_workers=job_workers,
                max_queued=max_queued, max_per_tenant=max_per_tenant, job_ttl_hours=job_ttl_hours,
-               max_submissions_per_hour=max_submissions_per_hour)
+               max_submissions_per_hour=max_submissions_per_hour, allowed_hosts=allowed_hosts)
 
 
 def main():
@@ -316,7 +402,11 @@ def main():
     parser.add_argument("--max-per-tenant", type=int, default=8)
     parser.add_argument("--job-ttl-hours", type=int, default=24)
     parser.add_argument("--max-submissions-per-hour", type=int, default=120)
+    parser.add_argument("--allowed-host", action="append", default=[], metavar="HOSTNAME",
+                        help="extra Host/Origin hostname to accept (e.g. a local TLS reverse proxy's "
+                             "name); loopback names are always accepted; repeatable")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     keys_raw = os.environ.get("CPU_REASONING_API_KEYS_JSON", "")
     api_keys = json.loads(keys_raw) if keys_raw else None
     server = create_server(args.port, model_url=args.model_url,
@@ -324,7 +414,8 @@ def main():
                            max_inflight=args.max_inflight, jobs_db=args.jobs_db,
                            job_workers=args.job_workers, max_queued=args.max_queued,
                            max_per_tenant=args.max_per_tenant, job_ttl_hours=args.job_ttl_hours,
-                           max_submissions_per_hour=args.max_submissions_per_hour)
+                           max_submissions_per_hour=args.max_submissions_per_hour,
+                           allowed_hosts=tuple(args.allowed_host))
     print(f"CPU reasoning preview http://127.0.0.1:{server.server_port}")
     print("Use GET /healthz, POST /v1/reason and /v1/ask; model runs separately on loopback")
     if not server.api_keys:

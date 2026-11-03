@@ -83,7 +83,7 @@ Closes out the arithmetic research thread so its result informs the engine desig
 - [ ] **M1.4** Model adapter interface: llama.cpp adapter validates model identity, context size and per-request thinking before serving (audit G5); transport failures (connection, timeout, HTTP error) are reported as retryable upstream errors, internal errors are not (audit G3).
   *Accept:* clear startup errors on mismatch; tests with `fake_llama.py`, including a programming error that must not come back as 503 retryable.
 
-- [ ] **M1.5** API hardening (audit G1, G2): reject requests whose `Host` is not a loopback name or the bound address, or whose `Origin` is cross-site, with 403 (DNS-rebinding defence); a catch-all handler turns any unexpected exception into `500 {"error": "internal_error", "request_id": ...}` and logs the traceback locally without request bodies; the launcher documents or sets `--api-key` for llama.cpp.
+- [x] **M1.5** API hardening (audit G1, G2): reject requests whose `Host` is not a loopback name or the bound address, or whose `Origin` is cross-site, with 403 (DNS-rebinding defence); a catch-all handler turns any unexpected exception into `500 {"error": "internal_error", "request_id": ...}` and logs the traceback locally without request bodies; the launcher documents or sets `--api-key` for llama.cpp.
   *Accept:* regression tests for a foreign `Host`, a cross-site `Origin`, and an injected internal exception (client gets a JSON 500, not a dropped connection); all existing tests pass.
 
 ## M2: Codebase grounding
@@ -171,3 +171,4 @@ One line per merged PR: `YYYY-MM-DD | task | change | measured result (or NOT RU
 
 - 2026-11-03 | — | Roadmap and CLAUDE.md created | NOT RUN
 - 2026-11-03 | M1.1 | `docs/audit-v0.10.md`: 20 prioritized gaps mapped to tasks; added M1.5; M0.1 instructions fixed (dev split, two servers, report commit) | 2 P0 gaps confirmed by local probe (DNS-rebinding Host accepted; internal error drops connection); no model run
+- 2026-11-03 | M1.5 | Host/Origin allowlist (403) + `--allowed-host`; catch-all JSON 500 with request id; JSON 405 for PUT/PATCH/OPTIONS; opt-in `LLAMA_API_KEY` sent by all model clients, launcher records whether llama.cpp enforces it; 21 new tests (266 total) | Offline only; real llama.cpp key enforcement NOT RUN
