@@ -58,21 +58,33 @@ questions, installers, auth, or external users.
 
 Closes out the arithmetic research thread so its result informs the engine design.
 
-- [ ] **M0.1** Run the 20-question GSM8K dev pilot (`scripts/run_windows_pilot.ps1 --limit 20`) and commit `results/*.report.md`.
-  *Accept:* report committed; progress log records accuracy and CPU-seconds per arm.
+- [ ] **M0.1** Run the 20-question GSM8K pilot on the frozen **dev** split and commit its `results/*.report.md`.
+  *Setup (once):* `py -m pip install datasets psutil`; `py scripts\fetch_gsm8k.py --limit 200`;
+  `py -m cpu_platform.datasets freeze` only if `data\splits\manifest.json` does not exist yet
+  (never `--force`); then `py -m cpu_platform.datasets validate`.
+  *Servers:* two model servers, each in its own PowerShell window left running:
+  `py -m cpu_platform.launch --model qwen3-0.6b --port 8080` and
+  `py -m cpu_platform.launch --model qwen3-8b --port 8081`.
+  *Run:* `scripts\run_windows_pilot.ps1 --dataset data/splits/dev.jsonl --limit 20 --output results/m0_pilot_dev20.jsonl`
+  (later arguments override the script's defaults). The report header must read `split: **dev**`, not `unregistered` or `eval`.
+  *Accept:* `results/m0_pilot_dev20.report.md` committed (`.gitignore` admits `results/*.report.md`); progress log records accuracy and CPU-seconds per arm.
 - [ ] **M0.2** Decide which reasoning mode NOEMA Engine uses by default (prose reasoning, native thinking, sampled + checked) based on M0.1.
   *Accept:* decision and evidence written in `docs/decisions/0001-default-reasoning-mode.md`.
 
 ## M1: Engine foundation
 
-- [ ] **M1.1** Gap audit: v0.10 against the product goal (security, API stability, execution, retrieval, packaging, observability).
+- [x] **M1.1** Gap audit: v0.10 against the product goal (security, API stability, execution, retrieval, packaging, observability).
   *Accept:* `docs/audit-v0.10.md` with a prioritized gap list; each gap mapped to a roadmap task or marked out of scope.
 - [ ] **M1.2** Coder-model presets in `hardware.py` / `launch.py`: Qwen3-Coder-30B-A3B (MoE, ~3B active parameters per token) and a dense 7B coder as fallback; RAM-fit checks.
+  Each preset declares whether the model supports thinking; thinking flags (`/no_think`, `enable_thinking`, `--reasoning`) are sent only to models that do, not to anything whose name contains `qwen3` (audit G4).
   *Accept:* `--list-models` shows them; dry-run tests; user runs one and records tokens/s in the progress log.
 - [ ] **M1.3** Versioned request/result contract (`EngineRequest`, `EngineResult`) with fields for evidence, verified claims, unverified claims, execution records, cost and NOT RUN items.
   *Accept:* dataclasses plus JSON schema in `docs/`; contract tests; existing endpoints unchanged.
-- [ ] **M1.4** Model adapter interface: llama.cpp adapter validates model identity, context size and per-request thinking before serving.
-  *Accept:* clear startup errors on mismatch; tests with `fake_llama.py`.
+- [ ] **M1.4** Model adapter interface: llama.cpp adapter validates model identity, context size and per-request thinking before serving (audit G5); transport failures (connection, timeout, HTTP error) are reported as retryable upstream errors, internal errors are not (audit G3).
+  *Accept:* clear startup errors on mismatch; tests with `fake_llama.py`, including a programming error that must not come back as 503 retryable.
+
+- [ ] **M1.5** API hardening (audit G1, G2): reject requests whose `Host` is not a loopback name or the bound address, or whose `Origin` is cross-site, with 403 (DNS-rebinding defence); a catch-all handler turns any unexpected exception into `500 {"error": "internal_error", "request_id": ...}` and logs the traceback locally without request bodies; the launcher documents or sets `--api-key` for llama.cpp.
+  *Accept:* regression tests for a foreign `Host`, a cross-site `Origin`, and an injected internal exception (client gets a JSON 500, not a dropped connection); all existing tests pass.
 
 ## M2: Codebase grounding
 
@@ -158,3 +170,4 @@ arithmetic benchmark modes not needed by M0.
 One line per merged PR: `YYYY-MM-DD | task | change | measured result (or NOT RUN)`.
 
 - 2026-11-03 | — | Roadmap and CLAUDE.md created | NOT RUN
+- 2026-11-03 | M1.1 | `docs/audit-v0.10.md`: 20 prioritized gaps mapped to tasks; added M1.5; M0.1 instructions fixed (dev split, two servers, report commit) | 2 P0 gaps confirmed by local probe (DNS-rebinding Host accepted; internal error drops connection); no model run

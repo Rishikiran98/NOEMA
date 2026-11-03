@@ -7,6 +7,9 @@ build/
 dist/
 results/*
 !results/.gitkeep
+# Markdown reports are small, human-readable evidence and are committed (roadmap M0.1).
+# Raw .jsonl outputs and failure dumps stay local.
+!results/*.report.md
 .env
 *.gguf
 *.sqlite*
