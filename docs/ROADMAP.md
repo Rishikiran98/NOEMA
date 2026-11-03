@@ -1,0 +1,160 @@
+# NOEMA roadmap
+
+**Definition of success:** NOEMA is a private, CPU-native reasoning engine that businesses can
+deploy on their own infrastructure, trust with meaningful work, and pay to use.
+
+**First product: NOEMA Engine.** Private reasoning infrastructure for software engineering
+teams: deploy locally, connect a private codebase, ask complex engineering questions, run
+controlled verification, and get auditable answers or proposed code changes, with no
+cloud-hosted inference. First customers: teams with sensitive repositories, on-premises
+requirements or strict inference-cost limits.
+
+**Why this fits the architecture:** code comes with a real checker (tests and execution), and
+claims about a codebase can be checked against its source. A local model proposes; exact
+execution and source checks verify; search picks what survives. The differentiator is the
+**audit trail**: what was executed, what passed, and which claims were verified against the
+source.
+
+How Claude Code uses this file: see [CLAUDE.md](../CLAUDE.md). Take the first unchecked task
+in the current milestone, tick it in the same PR, and add a line to the progress log.
+
+---
+
+## v1.0 release gates
+
+Proposed acceptance thresholds, not capabilities NOEMA has today. Numbers marked *TBD* are
+fixed in M4, once a representative workload and hardware baseline exist.
+
+| Dimension | v1.0 target |
+|---|---|
+| Accuracy | Measurable improvement over the direct-model baseline on the M4 workload, held-out, with a paired confidence interval |
+| Verification | Every result separates verified facts (with the checker that verified them) from unverified model claims |
+| Reliability | ≥ 99.5% of requests end in a well-formed result or explicit error under supported conditions |
+| Privacy | Local-only by default; documented data retention; no mandatory external inference |
+| Deployment | Reproducible install on supported Windows and Linux CPU hardware |
+| Security | Isolated tool execution, access controls, security tests, no unresolved critical vulnerabilities |
+| Performance | Published p50/p95 latency, RAM and CPU per supported hardware profile (*TBD targets*) |
+| Commercial | ≥ 3 external pilots with repeat use, ≥ 1 paying customer |
+
+---
+
+## Status snapshot (v0.10.0)
+
+**Works today:** CPU-only llama.cpp launcher with hardware detection and GPU hiding; local
+API; exact arithmetic and propositional-logic checkers; reasoning-text arithmetic checker
+with grounding; paired matched-compute experiment harness; frozen dev/eval splits with leak
+guard; provenance (model SHA256, build, RSS); Markdown reports with failure labels; SQLite
+jobs; 245 offline tests.
+
+**Measured on real hardware so far:** Qwen3-0.6B at ~28 tokens/s on an i7-8850H (6 threads);
+on 5 smoke questions, free-form reasoning 5/5 vs grammar-constrained plans 1/5.
+
+**Not yet:** any codebase capability, code execution, a real-model benchmark beyond smoke
+questions, installers, auth, or external users.
+
+---
+
+## M0: Evidence baseline (parallel with M1; runs on the user's laptop)
+
+Closes out the arithmetic research thread so its result informs the engine design.
+
+- [ ] **M0.1** Run the 20-question GSM8K dev pilot (`scripts/run_windows_pilot.ps1 --limit 20`) and commit `results/*.report.md`.
+  *Accept:* report committed; progress log records accuracy and CPU-seconds per arm.
+- [ ] **M0.2** Decide which reasoning mode NOEMA Engine uses by default (prose reasoning, native thinking, sampled + checked) based on M0.1.
+  *Accept:* decision and evidence written in `docs/decisions/0001-default-reasoning-mode.md`.
+
+## M1: Engine foundation
+
+- [ ] **M1.1** Gap audit: v0.10 against the product goal (security, API stability, execution, retrieval, packaging, observability).
+  *Accept:* `docs/audit-v0.10.md` with a prioritized gap list; each gap mapped to a roadmap task or marked out of scope.
+- [ ] **M1.2** Coder-model presets in `hardware.py` / `launch.py`: Qwen3-Coder-30B-A3B (MoE, ~3B active parameters per token) and a dense 7B coder as fallback; RAM-fit checks.
+  *Accept:* `--list-models` shows them; dry-run tests; user runs one and records tokens/s in the progress log.
+- [ ] **M1.3** Versioned request/result contract (`EngineRequest`, `EngineResult`) with fields for evidence, verified claims, unverified claims, execution records, cost and NOT RUN items.
+  *Accept:* dataclasses plus JSON schema in `docs/`; contract tests; existing endpoints unchanged.
+- [ ] **M1.4** Model adapter interface: llama.cpp adapter validates model identity, context size and per-request thinking before serving.
+  *Accept:* clear startup errors on mismatch; tests with `fake_llama.py`.
+
+## M2: Codebase grounding
+
+- [ ] **M2.1** Local repository indexer: walks a repo honouring `.gitignore`; skips binaries, large files and likely secrets (`.env`, keys); chunks Python by function/class via `ast`, other files by line windows; incremental re-index by mtime and hash.
+  *Accept:* indexes NOEMA itself in < 10 s on the laptop; tests for ignore rules, secret skipping and incremental updates.
+- [ ] **M2.2** Retrieval: BM25 keyword search over chunks plus symbol lookup (definitions, call sites). Standard library only.
+  *Accept:* retrieval eval on ≥ 30 hand-written NOEMA questions with gold files; recall@5 reported.
+- [ ] **M2.3** Grounded codebase Q&A: retrieve, answer with `file:line` citations, return an EngineResult.
+  *Accept:* `/v2/repo/ask` endpoint (or CLI) works against a fake model; real-model run recorded.
+- [ ] **M2.4** Citation verifier: every cited file exists, line ranges are valid, quoted code matches the source exactly; unverifiable citations are labelled, not dropped silently.
+  *Accept:* adversarial tests (invented file, wrong lines, paraphrased quote, real-but-irrelevant citation flagged as "exists, relevance NOT CHECKED").
+- [ ] **M2.5** Prompt-injection hardening for repository content (comments or docs telling the model to ignore instructions).
+  *Accept:* adversarial fixtures; repository text always passed as data, never as instructions.
+
+## M3: Execution and verification
+
+- [ ] **M3.1** Sandbox interface (`run(command, workdir, timeout, network=False) -> ExecutionRecord`) with a `dev` backend: temporary copy of the repo, timeouts, output caps, network-disabling environment, resource limits where the OS supports them.
+  *Accept:* every ExecutionRecord states its backend and that `dev` is **not a security boundary**; tests for timeout, output cap, and no writes to the original repo.
+- [ ] **M3.2** Container backend (Docker or WSL2): no network, read-only base, CPU/RAM limits, non-root.
+  *Accept:* same contract tests as M3.1 pass; documented setup on Windows and Linux.
+- [ ] **M3.3** Test runner: detect and run `unittest` / `pytest`; parse pass/fail per test; record duration.
+  *Accept:* works on NOEMA's own suite inside the sandbox.
+- [ ] **M3.4** Patch pipeline: model proposes a unified diff; validate it (applies cleanly, touches only allowed paths, size limit); apply in the sandbox copy only.
+  *Accept:* adversarial diffs (path traversal, binary, huge, touching tests to make them pass) are rejected or flagged.
+- [ ] **M3.5** Propose-and-test search: N candidate patches, run targeted then full tests, keep passing ones, prefer the smallest diff; stop early when one passes.
+  *Accept:* matched-cost comparison against single-shot in M4.
+- [ ] **M3.6** Audit report: Markdown and JSON per request, covering question, retrieved evidence, citations and their status, commands run, test results, patch, cost, and what was NOT checked.
+  *Accept:* a human can reproduce every verified claim from the report alone.
+
+## M4: Evaluation (the accuracy gate)
+
+- [ ] **M4.1** Injected-bug benchmark: AST mutation operators (flip comparison, off-by-one, swapped operands, wrong constant, dropped condition) applied to functions covered by tests; keep only mutants the tests catch; the engine must restore passing tests without editing tests.
+  *Accept:* ≥ 200 mutants from NOEMA plus ≥ 1 other open-source Python repo; frozen dev/eval split using `cpu_platform.datasets`; generator seeds recorded.
+- [ ] **M4.2** Repository-QA benchmark: questions with gold files/lines and checkable answers.
+  *Accept:* ≥ 50 questions, frozen split.
+- [ ] **M4.3** Baselines at matched CPU-seconds: (a) model alone, no retrieval; (b) model + retrieval, no verification; (c) NOEMA full (retrieval + citation check + sandboxed tests + search).
+  *Accept:* paired results with bootstrap intervals; held-out eval run once with settings frozen on dev.
+- [ ] **M4.4** Performance profile per supported hardware: p50/p95 latency, peak RAM, CPU-seconds, index time.
+  *Accept:* published table; sets the *TBD* release-gate numbers.
+
+**Go/no-go after M4:** if NOEMA full doesn't beat model + retrieval at matched cost, revisit the
+search and verification design before M5. The audit trail alone may still be a product, but
+the claim changes.
+
+## M5: Productization
+
+- [ ] **M5.1** Stable versioned API plus Python SDK; deprecation policy for legacy routes.
+- [ ] **M5.2** Authentication (local API keys → configurable), roles, audit log of every request.
+- [ ] **M5.3** Threat model and security test suite (OWASP LLM Top 10 as reference); secrets redaction in logs and traces.
+- [ ] **M5.4** Windows installer and Linux package with pinned llama.cpp build and model hashes; no PowerShell steps for end users.
+- [ ] **M5.5** Monitoring: health, request metrics, error rates, resource use; opt-in only.
+- [ ] **M5.6** Deployment and operations docs; upgrade and data-retention controls.
+
+## M6: Customer validation
+
+- [ ] **M6.1** Three external pilots on real repositories (on their hardware, their data stays local).
+- [ ] **M6.2** Failure taxonomy from pilot use feeds back into M2–M4.
+- [ ] **M6.3** Willingness-to-pay test; pricing and licensing model.
+- [ ] **M6.4** v1.0 launch when every release gate is met.
+
+---
+
+## Out of scope until after v1.0
+
+Pretraining or fine-tuning foundation models; general-intelligence claims; multi-node
+clusters; public internet-facing SaaS; autonomous agents acting outside the sandbox; new
+arithmetic benchmark modes not needed by M0.
+
+## Known risks
+
+- **Model capability:** small models may not pick correct fixes often enough for search to
+  help; mitigated by MoE coder models (M1.2) and measured in M4.
+- **CPU latency:** large repos and multi-candidate search can be slow; M4.4 decides the supported envelope.
+- **Sandbox escape:** the `dev` backend is not isolation; nothing customer-facing ships on it (M3.2).
+- **Benchmark leakage:** public code benchmarks are in training data; injected-bug and
+  private-repo evaluations (M4.1, M6) are the primary evidence.
+- **Overclaiming:** passing tests don't prove a fix is correct; reports say exactly what was checked.
+
+---
+
+## Progress log
+
+One line per merged PR: `YYYY-MM-DD | task | change | measured result (or NOT RUN)`.
+
+- 2026-11-03 | — | Roadmap and CLAUDE.md created | NOT RUN
