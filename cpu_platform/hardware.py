@@ -24,16 +24,36 @@ import time
 GB = 1024 ** 3
 
 
+GENERIC_KV_BYTES_PER_TOKEN = 160 * 1024  # generous allowance when a model's shape is not recorded
+OS_RESERVE_BYTES = 10 * GB               # left for the OS, the API and the user's other work
+
+
 @dataclass(frozen=True)
 class ModelPreset:
     name: str
     hf: str                # llama.cpp --hf-repo value, REPO:QUANT
-    params_b: float        # parameters, billions
+    params_b: float        # total parameters, billions
     approx_bytes: int      # approximate GGUF file size; verify against the actual download
+    role: str = "general"  # "general" (reasoning experiments) or "coder" (NOEMA Engine)
+    # Hybrid thinking: the model accepts per-request enable_thinking / /no_think. Models
+    # without it (e.g. Qwen3-Coder, Qwen2.5-Coder) must not be sent those switches.
+    thinking: bool = True
+    active_params_b: float | None = None   # MoE: parameters used per token; None = dense
+    # f16 KV cache bytes per token = 2 (K,V) * layers * kv_heads * head_dim * 2 bytes.
+    kv_bytes_per_token: int | None = None
+    ctx_size: int | None = None            # preferred context; None = hardware recommendation
+    note: str = ""
 
     @property
     def gb(self) -> float:
         return round(self.approx_bytes / GB, 2)
+
+    @property
+    def active_bytes(self) -> int:
+        """Weight bytes read per generated token (all of them for a dense model)."""
+        if not self.active_params_b:
+            return self.approx_bytes
+        return int(self.approx_bytes * self.active_params_b / self.params_b)
 
 
 # Sizes are approximate published GGUF sizes. Repos/quantizations can change upstream;
@@ -44,6 +64,19 @@ MODEL_PRESETS: dict[str, ModelPreset] = {p.name: p for p in (
     ModelPreset("qwen3-4b", "Qwen/Qwen3-4B-GGUF:Q4_K_M", 4.0, int(2.50 * GB)),
     ModelPreset("qwen3-8b", "Qwen/Qwen3-8B-GGUF:Q4_K_M", 8.2, int(5.03 * GB)),
     ModelPreset("qwen3-14b", "Qwen/Qwen3-14B-GGUF:Q4_K_M", 14.8, int(9.00 * GB)),
+    # NOEMA Engine coder models (roadmap M1.2). Neither has hybrid thinking.
+    # Qwen3-Coder-30B-A3B: MoE, 30.5B total / 3.3B active; 48 layers, 4 KV heads, head_dim 128.
+    # Qwen publishes no official GGUF of it, so this is Unsloth's quantization; the
+    # launcher's provenance records the SHA256 of the file actually loaded.
+    ModelPreset("qwen3-coder-30b-a3b", "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M", 30.5,
+                int(18.6 * GB), role="coder", thinking=False, active_params_b=3.3,
+                kv_bytes_per_token=2 * 48 * 4 * 128 * 2, ctx_size=16384,
+                note="primary coder; third-party GGUF (unsloth)"),
+    # Dense fallback for machines without ~21 GB to spare: 28 layers, 4 KV heads, head_dim 128.
+    ModelPreset("qwen2.5-coder-7b", "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M", 7.6,
+                int(4.68 * GB), role="coder", thinking=False,
+                kv_bytes_per_token=2 * 28 * 4 * 128 * 2, ctx_size=16384,
+                note="dense coder fallback"),
 )}
 SMALL_DEFAULT = "qwen3-0.6b"
 
@@ -242,12 +275,23 @@ def gpus() -> list[dict]:
 
 # ---------------------------------------------------------------- profile
 
+def ram_budget(total_ram: int) -> float:
+    """Bytes the model server may use: 60% of RAM, or all but a fixed OS reserve on larger
+    machines (the OS and API need a roughly fixed amount, not a fraction)."""
+    return max(0.6 * total_ram, total_ram - OS_RESERVE_BYTES)
+
+
+def model_memory_bytes(preset: ModelPreset, ctx_size: int) -> int:
+    """Weights + f16 KV cache for ctx_size tokens + 0.5 GB runtime buffers."""
+    kv = preset.kv_bytes_per_token or GENERIC_KV_BYTES_PER_TOKEN
+    return preset.approx_bytes + int(0.5 * GB) + ctx_size * kv
+
+
 def model_fits(preset: ModelPreset, total_ram: int | None, ctx_size: int) -> bool:
-    """Weights + KV cache/runtime headroom must fit in 60% of RAM (OS and API need the rest)."""
+    """Weights + KV cache + runtime headroom must fit in the RAM budget."""
     if total_ram is None:
         return preset.name == SMALL_DEFAULT
-    overhead = int(0.5 * GB) + ctx_size * 160 * 1024  # generous KV-cache allowance
-    return preset.approx_bytes + overhead <= 0.6 * total_ram
+    return model_memory_bytes(preset, ctx_size) <= ram_budget(total_ram)
 
 
 def recommend(total_ram: int | None, cores: int | None, logical: int | None,
@@ -255,17 +299,19 @@ def recommend(total_ram: int | None, cores: int | None, logical: int | None,
     threads = cores or max(1, (logical or 2) // 2)
     threads = max(1, min(threads, 64))
     ctx = 4096 if (total_ram or 0) >= 7.5 * GB else 2048
-    feasible = [p for p in MODEL_PRESETS.values() if model_fits(p, total_ram, ctx)]
-    # The comparison model is the largest feasible preset up to 8B: larger ones are
+    feasible = [p for p in MODEL_PRESETS.values() if model_fits(p, total_ram, p.ctx_size or ctx)]
+    # The comparison model is the largest feasible general preset up to 8B: larger ones are
     # usually too slow on laptop CPUs for a 100-question benchmark.
-    large = max((p for p in feasible if p.params_b <= 8.5 and p.name != SMALL_DEFAULT),
-                key=lambda p: p.params_b, default=None)
+    large = max((p for p in feasible if p.role == "general" and p.params_b <= 8.5
+                 and p.name != SMALL_DEFAULT), key=lambda p: p.params_b, default=None)
+    coders = sorted((p for p in feasible if p.role == "coder"), key=lambda p: p.params_b, reverse=True)
     estimates = {}
     if bandwidth:
         for p in MODEL_PRESETS.values():
-            # Token generation streams every weight once per token, so tokens/s is roughly
-            # bandwidth / size. The bandwidth input is a single-thread lower bound.
-            estimates[p.name] = round(bandwidth / p.approx_bytes, 1)
+            # Token generation streams every weight it uses once per token, so tokens/s is
+            # roughly bandwidth / bytes read: the whole file for a dense model, only the
+            # active experts for MoE. The bandwidth input is a single-thread lower bound.
+            estimates[p.name] = round(bandwidth / p.active_bytes, 1)
     return {
         "threads": threads,
         "threads_batch": threads,
@@ -274,11 +320,12 @@ def recommend(total_ram: int | None, cores: int | None, logical: int | None,
         "parallel_slots": 1,
         "small_model": SMALL_DEFAULT,
         "large_model": large.name if large else None,
+        "coder_model": coders[0].name if coders else None,
         "feasible_models": [p.name for p in feasible],
         "token_rate_estimate_per_s": estimates or None,
         "notes": [
             "threads = physical cores; hyperthreads usually slow down token generation",
-            "token_rate_estimate = single-thread copy bandwidth / model size: order of magnitude only, not a measurement",
+            "token_rate_estimate = single-thread copy bandwidth / bytes read per token (active experts for MoE): order of magnitude only, not a measurement",
         ],
     }
 

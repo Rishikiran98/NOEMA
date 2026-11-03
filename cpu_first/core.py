@@ -24,6 +24,18 @@ def model_server_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 
+# Qwen3 variants WITHOUT hybrid thinking: Qwen3-Coder is a non-thinking instruct model,
+# and the 2507 releases split into instruct-only and thinking-only models. Sending them
+# /no_think or enable_thinking adds stray text to every prompt (audit G4).
+NON_HYBRID_QWEN3_MARKERS = ("coder", "instruct-2507", "thinking-2507")
+
+
+def hybrid_thinking(model_name: str) -> bool:
+    """True when the model accepts per-request thinking on/off (Qwen3 hybrid models)."""
+    name = model_name.lower()
+    return "qwen3" in name and not any(marker in name for marker in NON_HYBRID_QWEN3_MARKERS)
+
+
 class InvalidExpression(ValueError):
     pass
 
@@ -195,7 +207,8 @@ class LocalLlama:
 
     @property
     def disables_thinking(self) -> bool:
-        return "qwen3" in self.model.lower()
+        """Hybrid-thinking models get thinking switched off unless a request asks for it."""
+        return hybrid_thinking(self.model)
 
     def chat(self, prompt: str, question: str, max_tokens: int = 384, *,
              temperature: float = 0.0, seed: int | None = None,
