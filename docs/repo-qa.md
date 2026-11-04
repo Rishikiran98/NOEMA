@@ -63,8 +63,25 @@ Authentication, Host/Origin checks and the in-flight limit apply as for `/v1`.
 
 ## Real-model run (acceptance)
 
-NOT RUN. On the laptop, with the coder model running on port 8080 (see M1.2), run three
-questions and send back the text output of each:
+**2026-11-04, user's laptop** (i7-8850H, 32 GB, CPU-only llama.cpp), model
+`unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M`, code at `ecb99ef`. `--expect-model
+qwen3-coder-30b-a3b` passed against the real server (model id and context checks, M1.4).
+Citations were checked by hand against the source; "verdict" is a human reading, not a checker.
+
+| Question | Prompt + output tokens | Time | Citations (hand-checked) | Verdict |
+|---|---|---|---|---|
+| How does NOEMA keep secrets out of the repository index? | 3,424 + 174 | 158.8 s | 4, all inside excerpts and real: 59-66 = `SECRET_NAME_PATTERNS`, 71-79 = `SECRET_CONTENT_PATTERNS` exactly; 11-14 is the module docstring (describes, does not do) | correct |
+| What happens when the llama.cpp server returns HTTP 503? | 2,401 + 241 | 99.8 s | written as `[E3:59]`, `[E3:73]`, which the parser did not recognise (fixed: excerpt-id citations are now parsed) | **wrong basis**: retrieval missed `cpu_first/core.py:96-97` (`exc.code >= 500` → `ModelTransportError`); the model answered from `docs/repo-qa.md` and called line 73 "a test case": it is this page's PowerShell command containing the question |
+| Where is the bearer token compared, and why is that safe? | 1,766 + 118 | 58.7 s | 1, exact: `server.py:185-193` = `_tenant` with `hmac.compare_digest` | correct |
+
+Findings: (1) lexical retrieval misses numeric phrasings ("503" vs `>= 500`, "5xx");
+(2) documentation that quotes example questions can be retrieved as if it answered them;
+(3) the model fills gaps with plausible inventions ("a test case"), which citation checks
+(M2.4) can catch only when the cited text is compared with the claim, and relevance is not
+checked at all; (4) latency is dominated by prompt length: about 1 to 2.7 minutes for
+1.8k to 3.4k prompt tokens. Prefill and generation speed were not measured separately (M1.2).
+
+To repeat the run:
 
 ```powershell
 py -m cpu_platform.repo_qa . "How does NOEMA keep secrets out of the repository index?" --expect-model qwen3-coder-30b-a3b
