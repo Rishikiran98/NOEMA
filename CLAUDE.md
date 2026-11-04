@@ -70,7 +70,7 @@ numbers, line counts or test counts.
 | Path | What it is |
 |---|---|
 | `cpu_first/core.py` | llama.cpp client (`LocalLlama`), exact arithmetic, thinking/budget controls |
-| `cpu_platform/server.py` | loopback HTTP API (`/v1/reason`, `/v1/ask`, `/v1/verify-*`, `/v1/jobs`) |
+| `cpu_platform/server.py` | loopback HTTP API (`/v1/reason`, `/v1/ask`, `/v1/verify-*`, `/v1/jobs`, `/v2/repo/ask`) |
 | `cpu_platform/engine.py` | legacy reasoning routes (auto, hybrid, adaptive, proof, semantic) |
 | `cpu_platform/contract.py` | NOEMA Engine request/result contract 1.0 ([docs/engine-contract.md](docs/engine-contract.md)); every new engine route returns an `EngineResult` |
 | `cpu_platform/general.py` | `/v1/ask` general Q&A with evidence accounting |
@@ -81,6 +81,7 @@ numbers, line counts or test counts.
 | `cpu_platform/model_adapter.py` | checks the served model's identity, context and hash before serving (`--expect-model`); model-error classes live in `cpu_first/core.py` |
 | `cpu_platform/repo_index.py`, `ignore.py` | local repository index: gitignore-aware walker, secret skipping, `ast` chunks, symbols, incremental SQLite ([docs/repo-index.md](docs/repo-index.md)) |
 | `cpu_platform/retrieval.py` | BM25 search over the index, definitions and call sites, retrieval eval on `data/retrieval` (eval split needs user approval) ([docs/retrieval.md](docs/retrieval.md)) |
+| `cpu_platform/repo_qa.py` | grounded repository Q&A: retrieve, answer with citations, `EngineResult`; `RepoRegistry` allowlist for `/v2/repo/ask` ([docs/repo-qa.md](docs/repo-qa.md)) |
 | `cpu_platform/launch.py`, `hardware.py` | hardware-aware CPU-only llama.cpp launcher |
 | `cpu_platform/jobs.py` | SQLite job queue |
 | `tests/fake_llama.py` | offline stand-in for llama.cpp's HTTP API (not a model) |

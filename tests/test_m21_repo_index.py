@@ -136,6 +136,12 @@ class IgnoreRules(unittest.TestCase):
         extra = [f"--exclude-from={noemaignore}"] if noemaignore.is_file() else []
         listed = subprocess.run([GIT, "-C", str(REPO_ROOT), "ls-files", "-co", "--exclude-standard", *extra],
                                 capture_output=True, text=True, check=True).stdout.split()
+        if extra:
+            # Exclude patterns do not hide *tracked* files from ls-files; ask git which tracked
+            # files .noemaignore matches and drop them too.
+            tracked_ignored = subprocess.run([GIT, "-C", str(REPO_ROOT), "ls-files", "-c", "-i", *extra],
+                                             capture_output=True, text=True, check=True).stdout.split()
+            listed = [p for p in listed if p not in set(tracked_ignored)]
         self.assertEqual(ours, set(listed))
 
 

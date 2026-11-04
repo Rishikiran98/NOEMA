@@ -29,6 +29,7 @@ from .jobs import JobStore, JobWorkers, JobFault
 from . import __version__
 
 MAX_BODY_BYTES = 16 * 1024
+V2_MAX_BODY_BYTES = 64 * 1024   # EngineRequest questions may be up to 20,000 characters
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 log = logging.getLogger("noema.server")
 
@@ -51,7 +52,7 @@ class App(ThreadingHTTPServer):
                  jobs_db: str | None = None, job_workers: int = 1,
                  max_queued: int = 32, max_per_tenant: int = 8,
                  job_ttl_hours: int = 24, max_submissions_per_hour: int = 120,
-                 allowed_hosts: tuple[str, ...] = ()):
+                 allowed_hosts: tuple[str, ...] = (), repos=None):
         host = address[0]
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("Preview API binds to loopback only; use a TLS reverse proxy for deployment")
@@ -84,6 +85,8 @@ class App(ThreadingHTTPServer):
         # (max_inflight), so they cannot jointly overload the single local model.
         self.workers = (JobWorkers(self.jobs, engine, worker_count=job_workers, model_slots=self.slots)
                         if self.jobs else None)
+        # M2.3: repositories this server may answer about (RepoRegistry); None = /v2 off.
+        self.repos = repos
 
     def server_close(self):
         if self.workers:
@@ -195,14 +198,14 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _json_body(self):
+    def _json_body(self, limit: int = MAX_BODY_BYTES):
         if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
             raise JobFault("content_type_must_be_json", 415)
         n_str = self.headers.get("Content-Length")
         if not n_str or not n_str.isdigit():
             raise JobFault("content_length_required", 411)
         n = int(n_str)
-        if n > MAX_BODY_BYTES:
+        if n > limit:
             self.close_connection = True
             raise JobFault("body_too_large", 413)
         if n <= 0:
@@ -214,6 +217,46 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             raise JobFault("invalid_request_fields", 400)
         return body
+
+    def _repo_ask(self):
+        """POST /v2/repo/ask: an EngineRequest (task repo_ask) in, an EngineResult out."""
+        from .contract import ContractError, request_from_dict
+        from .repo_qa import RepoQA
+        if self.server.repos is None:
+            return self._send(503, {"error": "repos_not_configured"})
+        try:
+            body = self._json_body(V2_MAX_BODY_BYTES)
+        except JobFault as exc:
+            return self._send(exc.http_status, {"error": exc.code})
+        try:
+            request = request_from_dict(body)
+        except ContractError as exc:
+            return self._send(400, {"error": "invalid_request", "problems": exc.problems})
+        if request.task != "repo_ask":
+            return self._send(400, {"error": "invalid_request", "problems": ["task: this endpoint answers 'repo_ask'"]})
+        name = self.server.repos.resolve(request.repo.path)
+        if name is None:
+            # Never index or read a path the operator did not register.
+            return self._send(404, {"error": "repo_not_found"})
+        if request.repo.revision is not None:
+            return self._send(400, {"error": "invalid_request",
+                                    "problems": ["repo.revision: only the working tree is supported"]})
+        if not self.server.slots.acquire(blocking=False):
+            return self._send(429, {"error": "capacity_exceeded", "retryable": True})
+        self.server.metrics.begin()
+        status, latency, calls = "error", 0.0, 0
+        try:
+            retriever = self.server.repos.retriever(name)
+            try:
+                result = RepoQA(self.server.engine.model).ask(request, retriever, request_id=token_hex(8))
+            except ValueError as exc:   # e.g. thinking requested from a non-thinking model
+                status = "bad_request"
+                return self._send(400, {"error": "invalid_request", "detail": str(exc)})
+            status, latency, calls = result.status, result.cost.total_wall_seconds * 1000, result.cost.model_calls
+            return self._send(_v2_status(result), result.to_dict())
+        finally:
+            self.server.metrics.end(status, "repo_ask", latency, calls)
+            self.server.slots.release()
 
     def _validate_job_request(self, body: dict):
         if set(body) - {"question", "mode", "max_calls"}:
@@ -293,6 +336,8 @@ class Handler(BaseHTTPRequestHandler):
     def _post(self):
         if not self._auth():
             return
+        if self.path == "/v2/repo/ask":
+            return self._repo_ask()
         if self.path not in ("/v1/reason", "/v1/verify-plan", "/v1/verify-semantic-plan", "/v1/ask", "/v1/verify-logic", "/v1/jobs"):
             return self._send(404, {"error": "not_found"})
         try:
@@ -387,6 +432,12 @@ class Handler(BaseHTTPRequestHandler):
             self.server.slots.release()
 
 
+def _v2_status(result) -> int:
+    if result.status != "error":
+        return 200
+    return 503 if result.error.code in ("local_model_unavailable", "local_model_mismatch") else 502
+
+
 def create_server(port: int = 8070, *, engine: ReasoningEngine | None = None,
                   api_key: str = "", max_inflight: int = 2, model_url: str = "http://127.0.0.1:8080",
                   model_expectation=None,
@@ -394,14 +445,15 @@ def create_server(port: int = 8070, *, engine: ReasoningEngine | None = None,
                   jobs_db: str | None = None, job_workers: int = 1,
                   max_queued: int = 32, max_per_tenant: int = 8,
                   job_ttl_hours: int = 24, max_submissions_per_hour: int = 120,
-                  allowed_hosts: tuple[str, ...] = ()) -> App:
+                  allowed_hosts: tuple[str, ...] = (), repos=None) -> App:
     if max_inflight < 1 or max_inflight > 128:
         raise ValueError("max_inflight must be between 1 and 128")
     engine = engine or ReasoningEngine(LazyLocalModel(model_url, expectation=model_expectation))
     return App(("127.0.0.1", port), engine, api_key=api_key, max_inflight=max_inflight,
                api_keys=api_keys, jobs_db=jobs_db, job_workers=job_workers,
                max_queued=max_queued, max_per_tenant=max_per_tenant, job_ttl_hours=job_ttl_hours,
-               max_submissions_per_hour=max_submissions_per_hour, allowed_hosts=allowed_hosts)
+               max_submissions_per_hour=max_submissions_per_hour, allowed_hosts=allowed_hosts,
+               repos=repos)
 
 
 def check_model_at_startup(model: LazyLocalModel) -> str | None:
@@ -440,6 +492,10 @@ def main():
                              "name fragments")
     parser.add_argument("--min-ctx", type=int, help="minimum context size the model server must have")
     parser.add_argument("--expect-sha256", help="SHA256 of the GGUF file the server must have loaded")
+    parser.add_argument("--repo", action="append", default=[], metavar="NAME=PATH",
+                        help="enable POST /v2/repo/ask for this local repository; repeatable. Only "
+                             "registered repositories can be queried")
+    parser.add_argument("--index-dir", help="where repository indexes are kept (default: ~/.noema/index)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     expectation = None
@@ -451,6 +507,19 @@ def main():
                            ModelExpectation(min_ctx=args.min_ctx, sha256=args.expect_sha256, label="custom"))
         except ValueError as exc:
             parser.error(str(exc))
+    repos = None
+    if args.repo:
+        from .repo_qa import RepoRegistry
+        pairs = {}
+        for item in args.repo:
+            name, sep, path = item.partition("=")
+            if not sep or not name or not path:
+                parser.error("--repo takes NAME=PATH")
+            pairs[name] = path
+        try:
+            repos = RepoRegistry(pairs, db_dir=args.index_dir)
+        except ValueError as exc:
+            parser.error(str(exc))
     keys_raw = os.environ.get("CPU_REASONING_API_KEYS_JSON", "")
     api_keys = json.loads(keys_raw) if keys_raw else None
     server = create_server(args.port, model_url=args.model_url,
@@ -459,11 +528,15 @@ def main():
                            job_workers=args.job_workers, max_queued=args.max_queued,
                            max_per_tenant=args.max_per_tenant, job_ttl_hours=args.job_ttl_hours,
                            max_submissions_per_hour=args.max_submissions_per_hour,
-                           allowed_hosts=tuple(args.allowed_host), model_expectation=expectation)
+                           allowed_hosts=tuple(args.allowed_host), model_expectation=expectation,
+                           repos=repos)
     print(f"CPU reasoning preview http://127.0.0.1:{server.server_port}")
     print("Use GET /healthz, POST /v1/reason and /v1/ask; model runs separately on loopback")
     if not server.api_keys:
         print("No API key configured. Loopback only. Do not publicly expose this service.")
+    if repos is not None:
+        print("Repository Q&A on POST /v2/repo/ask for: " + ", ".join(repos.repos)
+              + ". Answers and citations are UNVERIFIED model output.")
     if expectation is not None:
         status = check_model_at_startup(server.engine.model)
         if status is not None:
