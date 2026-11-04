@@ -1,0 +1,1 @@
+{"utc": "2026-11-04T17:44:12Z", "commit": "978a35343026166843dceda77e3c3675ee73b51a", "split": "eval", "settings": {"k1": 1.2, "b": 0.75, "path_weight": 2, "symbol_weight": 3, "definition_bonus": 0.5, "max_per_file": 3, "role_weights": {"code": 1.0, "test": 0.6, "docs": 0.6}}, "recall@5": 0.95, "mrr": 0.804}

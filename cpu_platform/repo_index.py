@@ -42,7 +42,7 @@ import time
 
 from .ignore import IgnoreMatcher, parse_lines
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2          # 2: adds the refs table (call sites and imports, M2.2)
 DEFAULT_MAX_FILE_BYTES = 1024 * 1024
 WINDOW_LINES = 60
 WINDOW_OVERLAP = 10
@@ -115,6 +115,58 @@ class Symbol:
     path: str
     line: int
     end_line: int
+
+
+@dataclass
+class Ref:
+    """A use of a name: a call ``f(...)`` / ``obj.f(...)`` or an import ``from m import f``."""
+    name: str          # the called or imported name (last component)
+    kind: str          # call | import
+    path: str
+    line: int
+    caller: str | None # enclosing function/method qualname; None at module level
+    expr: str          # dotted text of the callee, e.g. "self.conn.execute"
+
+
+def _dotted(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        inner = _dotted(node.value)
+        return f"{inner}.{node.attr}" if inner else f"?.{node.attr}"
+    return None
+
+
+def python_refs(path: str, text: str) -> list[Ref]:
+    """Call sites and imports, each tagged with the enclosing definition. Empty if the
+    file does not parse."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return []
+    refs: list[Ref] = []
+
+    def visit(node: ast.AST, scope: list[str]):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                visit(child, scope + [child.name])
+                continue
+            caller = ".".join(scope) or None
+            if isinstance(child, ast.Call):
+                dotted = _dotted(child.func)
+                if dotted:
+                    refs.append(Ref(dotted.rsplit(".", 1)[-1], "call", path, child.lineno, caller, dotted[:200]))
+            elif isinstance(child, ast.ImportFrom):
+                for alias in child.names:
+                    refs.append(Ref(alias.name, "import", path, child.lineno, caller,
+                                    f"{'.' * child.level}{child.module or ''}.{alias.name}"[:200]))
+            elif isinstance(child, ast.Import):
+                for alias in child.names:
+                    refs.append(Ref(alias.name.rsplit(".", 1)[-1], "import", path, child.lineno, caller, alias.name[:200]))
+            visit(child, scope)
+
+    visit(tree, [])
+    return refs
 
 
 @dataclass
@@ -330,6 +382,11 @@ CREATE TABLE IF NOT EXISTS symbols (
     line INTEGER NOT NULL, end_line INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS symbols_path ON symbols(path);
+CREATE TABLE IF NOT EXISTS refs (
+    name TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+    line INTEGER NOT NULL, caller TEXT, expr TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS refs_name ON refs(name);
+CREATE INDEX IF NOT EXISTS refs_path ON refs(path);
 """
 
 
@@ -347,6 +404,12 @@ def connect(db: Path) -> sqlite3.Connection:
     version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if version is None:
         conn.execute("INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+    elif int(version[0]) == 1:
+        # v1 -> v2 added refs. Forget every file so the next update re-reads and re-chunks
+        # all of them (an index is a cache of the repository; nothing is lost).
+        with conn:
+            conn.execute("DELETE FROM files")
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),))
     elif int(version[0]) != SCHEMA_VERSION:
         conn.close()
         raise RuntimeError(f"{db} has index schema {version[0]}, expected {SCHEMA_VERSION}; delete it to rebuild")
@@ -469,6 +532,9 @@ class RepoIndex:
              for c in chunks])
         self.conn.executemany("INSERT INTO symbols VALUES (?, ?, ?, ?, ?)",
                               [(s.name, s.kind, s.path, s.line, s.end_line) for s in symbols])
+        if language == "python" and note is None:
+            self.conn.executemany("INSERT INTO refs VALUES (?, ?, ?, ?, ?, ?)",
+                                  [(r.name, r.kind, r.path, r.line, r.caller, r.expr) for r in python_refs(rel, text)])
         if previous is None or previous[3] == "skipped":
             stats.added += 1
         else:
@@ -488,6 +554,14 @@ class RepoIndex:
                                   (name, "%." + name)) if name
                 else self.conn.execute(query + " ORDER BY path, line"))
         return [Symbol(*row) for row in rows]
+
+    def refs(self, name: str, kind: str | None = None) -> list[Ref]:
+        query = "SELECT name, kind, path, line, caller, expr FROM refs WHERE name = ?"
+        args: tuple = (name,)
+        if kind:
+            query += " AND kind = ?"
+            args += (kind,)
+        return [Ref(*row) for row in self.conn.execute(query + " ORDER BY path, line", args)]
 
     def files(self) -> list[dict]:
         rows = self.conn.execute("SELECT path, size, sha256, language, status, skip_reason, note, chunks "

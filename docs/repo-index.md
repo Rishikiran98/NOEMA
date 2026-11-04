@@ -44,7 +44,9 @@ fixture of tricky patterns and on NOEMA itself (tested whenever git is installed
 
 Each chunk stores its exact text, 1-based `start_line`/`end_line` and SHA256, so a later
 citation check (M2.4) can compare quoted code with the source. Python definitions are also
-stored as symbols (name, kind, file, line span) for M2.2's symbol lookup.
+stored as symbols (name, kind, file, line span), and call sites and imports as refs (name,
+line, enclosing function, callee text) for [retrieval](retrieval.md). Index schema 2 added
+refs; a schema-1 index is upgraded automatically by re-reading every file.
 
 ## Incremental updates
 
@@ -70,6 +72,6 @@ the folder's ACLs. Delete the file to remove the index.
 
 ## Not done in M2.1
 
-* No search yet (M2.2), no answering (M2.3), no citation checks (M2.4).
-* No language-aware chunking beyond Python; no call-site extraction (M2.2).
+* No answering (M2.3), no citation checks (M2.4). Search is in [retrieval](retrieval.md) (M2.2).
+* No language-aware chunking or call sites beyond Python.
 * Not tested on Windows (junctions, ACLs) or on very large repositories.

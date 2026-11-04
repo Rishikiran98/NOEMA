@@ -1,0 +1,2 @@
+# Retrieval evaluation questions: never index them, or each question would match itself.
+data/retrieval/
