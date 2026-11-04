@@ -54,6 +54,10 @@ Rules:
 CITATION = re.compile(r"\[?\s*([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+):(\d+)(?:\s*[-–]\s*(\d+))?\s*\]?")
 # Real models also cite by excerpt id, e.g. [E3:59], [E3:59-61] or [E3] (seen with
 # Qwen3-Coder-30B-A3B on 2026-11-04). Line numbers are the absolute ones shown in the excerpt.
+# Inside brackets any path counts, so dotfiles and extensionless files can be cited
+# ([.env:1], [Makefile:3]); bare text still needs an extension, so prose like "step:1" is
+# not mistaken for a citation. [E3:59] is an excerpt id, handled below.
+BRACKETED_CITATION = re.compile(r"\[\s*(?!E\d+\s*[:\]])([A-Za-z0-9_./\\-]+):(\d+)(?:\s*[-–]\s*(\d+))?\s*\]")
 EXCERPT_CITATION = re.compile(r"\[\s*(E\d+)(?:\s*:\s*(\d+)(?:\s*[-–]\s*(\d+))?)?\s*\]")
 
 
@@ -65,27 +69,30 @@ class Citation:
     text: str                    # as written in the answer
     evidence_id: str | None      # excerpt containing the cited span, if any
     overlap_id: str | None = None  # else an excerpt the span partly overlaps (lines off by a few)
+    unknown_excerpt: bool = False  # [E9]-style id of an excerpt that was never shown
 
 
 def _matches(answer: str, shown: dict[str, Hit]):
-    """(position, path, start, end, text) for path citations and excerpt-id citations."""
-    for match in CITATION.finditer(answer):
-        path = match.group(1).replace("\\", "/")
-        while path.startswith("./"):
-            path = path[2:]
-        start = int(match.group(2))
-        yield match.start(), path, start, int(match.group(3) or start), match.group(0).strip()
+    """(position, path, start, end, text, unknown_excerpt) for path and excerpt-id citations."""
+    for pattern in (CITATION, BRACKETED_CITATION):
+        for match in pattern.finditer(answer):
+            path = match.group(1).replace("\\", "/")
+            while path.startswith("./"):
+                path = path[2:]
+            start = int(match.group(2))
+            yield match.start(), path, start, int(match.group(3) or start), match.group(0).strip(), False
     for match in EXCERPT_CITATION.finditer(answer):
         hit = shown.get(match.group(1))
         if hit is None:
-            # An excerpt id the model was never given: keep it, as an outside citation.
-            path, start, end = match.group(1), 0, 0
+            # An excerpt id the model was never given: keep it, flagged.
+            yield match.start(), match.group(1), 0, 0, match.group(0).strip(), True
+            continue
         elif match.group(2) is None:
             path, start, end = hit.path, hit.start_line, hit.end_line
         else:
             path, start = hit.path, int(match.group(2))
             end = int(match.group(3) or start)
-        yield match.start(), path, start, end, match.group(0).strip()
+        yield match.start(), path, start, end, match.group(0).strip(), False
 
 
 def parse_citations(answer: str, shown: dict[str, Hit]) -> list[Citation]:
@@ -93,7 +100,7 @@ def parse_citations(answer: str, shown: dict[str, Hit]) -> list[Citation]:
     deduplicated, in order. ``evidence_id`` is set when the span lies inside an excerpt the
     model was shown."""
     out, seen = [], set()
-    for _, path, start, end, text in sorted(_matches(answer, shown), key=lambda m: m[0]):
+    for _, path, start, end, text, unknown in sorted(_matches(answer, shown), key=lambda m: m[0]):
         if end < start:
             start, end = end, start
         key = (path, start, end)
@@ -104,7 +111,8 @@ def parse_citations(answer: str, shown: dict[str, Hit]) -> list[Citation]:
                        if hit.path == path and hit.start_line <= start and end <= hit.end_line), None)
         overlap = None if inside else next((eid for eid, hit in shown.items()
                                             if hit.path == path and start <= hit.end_line and hit.start_line <= end), None)
-        out.append(Citation(path, start, end, text, inside, overlap))
+        out.append(Citation(path, start, end, text, None if unknown else inside,
+                            None if unknown else overlap, unknown))
         if len(out) >= MAX_CITATIONS:
             break
     return out
@@ -147,8 +155,10 @@ def select_context(hits: list[Hit], max_chars: int) -> tuple[dict[str, Hit], int
 
 
 class RepoQA:
-    def __init__(self, model, *, top_k: int = DEFAULT_TOP_K, max_context_chars: int = DEFAULT_CONTEXT_CHARS):
+    def __init__(self, model, *, top_k: int = DEFAULT_TOP_K, max_context_chars: int = DEFAULT_CONTEXT_CHARS,
+                 check_citations: bool = True):
         self.model = model
+        self.check_citations = check_citations
         self.top_k = top_k
         self.max_context_chars = max_context_chars
 
@@ -164,7 +174,6 @@ class RepoQA:
                              excerpt=hit.text[:4000], retrieved_by="bm25:" + ",".join(hit.matched_terms)[:180])
                     for eid, hit in shown.items()]
         not_run = [NotRun("answer correctness", "no checker verifies what the answer says"),
-                   NotRun("citation verification", "files, line ranges and quotes are checked by M2.4 (not yet built)"),
                    NotRun("citation relevance", "whether a cited span supports the statement is NOT CHECKED")]
         if dropped:
             not_run.append(NotRun("context", f"{dropped} retrieved chunk(s) not shown: context budget "
@@ -186,6 +195,7 @@ class RepoQA:
         except (UpstreamUnavailable, UpstreamFailed) as exc:
             return self._error(request_id, exc, evidence, started)
         answer = completion.content.strip()
+        citations = []
         model_info = ModelInfo(getattr(self.model, "model", None) or "unknown")
         cost = Cost(model_calls=1, prompt_tokens=completion.prompt_tokens or 0,
                     completion_tokens=completion.completion_tokens or 0,
@@ -196,7 +206,8 @@ class RepoQA:
             evidence.append(Evidence(id="answer", kind="model_output", source="model", excerpt=answer[:4000]))
             unverified.append(UnverifiedClaim(answer, "model answer; no checker verifies its content",
                                               ["answer"] + list(shown)))
-            for cite in parse_citations(answer, shown):
+            citations = parse_citations(answer, shown)
+            for cite in citations:
                 if cite.evidence_id:
                     reason = (f"inside excerpt {cite.evidence_id} shown to the model; existence, exact lines "
                               "and relevance NOT CHECKED")
@@ -205,7 +216,7 @@ class RepoQA:
                               "NOT CHECKED")
                 else:
                     reason = "points outside every excerpt shown to the model; may be invented; NOT CHECKED"
-                if cite.start_line == 0:   # [E9]-style id of an excerpt that was never shown
+                if cite.unknown_excerpt:   # [E9]-style id of an excerpt that was never shown
                     label = f"[{cite.path}]"
                     reason = f"names excerpt id {cite.path}, which was not shown to the model; invented; NOT CHECKED"
                 else:
@@ -217,10 +228,15 @@ class RepoQA:
         status = "ok" if answer else "incomplete"
         if not answer:
             not_run.append(NotRun("answer", "the model returned no text (thinking may have used the budget)"))
-        return validate_result(EngineResult(
+        result = validate_result(EngineResult(
             request_id=request_id, task="repo_ask", status=status, engine_version=__version__,
             answer=answer or None, unverified_claims=unverified, evidence=evidence, cost=cost,
             not_run=not_run + not_measured(cost), model=model_info))
+        if answer and citations and self.check_citations:
+            # M2.4: deterministic checks of each citation against the working tree.
+            from .citation_check import apply_to_result, check_answer, checker_for
+            result = apply_to_result(result, check_answer(answer, citations, checker_for(retriever)))
+        return result
 
     def _error(self, request_id, exc, evidence, started) -> EngineResult:
         cost = Cost(total_wall_seconds=round(time.perf_counter() - started, 6))
@@ -283,7 +299,7 @@ def render_text(result: EngineResult) -> str:
             lines.append(f"  {ev.id}  {ev.source}:{ev.start_line}-{ev.end_line}")
     cites = [u for u in result.unverified_claims if u.claim.startswith("citation ")]
     if cites:
-        lines.append("citations (UNVERIFIED):")
+        lines.append("citations (file/lines/quotes checked where possible; relevance NOT CHECKED):")
         lines += [f"  {u.claim[9:]}  - {u.reason}" for u in cites]
     lines.append("not run / not checked:")
     lines += [f"  {n.item}: {n.reason}" for n in result.not_run]

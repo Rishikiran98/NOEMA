@@ -116,6 +116,10 @@ class Retriever:
 
     def __init__(self, index: RepoIndex):
         self.index = index
+        self.root = index.root
+        # path -> (status, skip_reason, sha256) at build time; the citation checker (M2.4)
+        # uses it to read only files the index accepted.
+        self.file_status = {f["path"]: (f["status"], f["skip_reason"], f["sha256"]) for f in index.files()}
         self.chunks: list[Chunk] = index.chunks()
         self.term_freqs: list[dict[str, int]] = []
         self.lengths: list[int] = []
