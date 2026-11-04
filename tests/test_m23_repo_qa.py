@@ -181,7 +181,11 @@ class Answering(Workspace):
         result = qa.RepoQA(model).ask(request(), self.retriever, request_id="r1")
         result_from_dict(json.loads(result.to_json()))                     # valid contract
         self.assertEqual((result.status, result.answer, result.task), ("ok", ANSWER, "repo_ask"))
-        self.assertEqual(result.checked_claims, [])                        # nothing is verified in M2.3
+        # M2.4: citations are now checked, but every checked claim is about one citation's
+        # file, lines or quote; none is about the answer, which stays unverified.
+        self.assertTrue(result.checked_claims)
+        self.assertTrue(all(k.checker.startswith("citation_check.") for k in result.checked_claims))
+        self.assertFalse(any(ANSWER in k.claim for k in result.checked_claims))
         spans = [e for e in result.evidence if e.kind == "file_span"]
         self.assertTrue(spans)
         files = {}
@@ -198,7 +202,8 @@ class Answering(Workspace):
         self.assertIn("partly overlaps", claims["citation app/auth.py:9-14"].reason)
         self.assertIn("may be invented", claims["citation app/nowhere.py:1-2"].reason)
         not_run = {n.item for n in result.not_run}
-        self.assertTrue({"answer correctness", "citation verification", "citation relevance",
+        self.assertNotIn("citation verification", {n.item for n in result.not_run})   # M2.4 does it now
+        self.assertTrue({"answer correctness", "citation relevance",
                          "cost.cpu_seconds", "cost.peak_rss_bytes"} <= not_run)
         self.assertEqual((result.cost.model_calls, result.cost.prompt_tokens, result.cost.completion_tokens),
                          (1, 800, 60))
@@ -299,7 +304,8 @@ class Endpoint(Workspace):
         status, data = self.post(server, self.body())
         self.assertEqual(status, 200)
         result = result_from_dict(data)
-        self.assertEqual((result.status, result.checked_claims), ("ok", []))
+        self.assertEqual(result.status, "ok")
+        self.assertTrue(all(k.checker.startswith("citation_check.") for k in result.checked_claims))
         self.assertTrue(any(u.claim.startswith("citation ") for u in result.unverified_claims))
         self.assertTrue(any(e.kind == "file_span" for e in result.evidence))
 

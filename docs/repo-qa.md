@@ -21,13 +21,14 @@ and [search](retrieval.md); returns an [`EngineResult`](engine-contract.md).
 |---|---|
 | `evidence[]` (`file_span`) | each excerpt the model saw: path, lines, SHA256 of the exact text, matched terms |
 | `unverified_claims[]` | the answer, and one entry per citation with its inside/overlap/outside status |
-| `checked_claims[]` | **empty**: nothing is verified in M2.3 |
+| `checked_claims[]` | citation checks only (M2.4): file exists, lines exist, quoted code appears; never a claim about the answer |
 | `not_run[]` | answer correctness, citation verification (M2.4), citation relevance, unmeasured costs, dropped excerpts |
 | `cost` | 1 model call, tokens, model and total seconds |
 
 "Inside an excerpt" only means the model pointed at code it was shown. It does **not** mean
-the citation is accurate or that the code supports the statement. Exact line and quote
-checks arrive with M2.4. Relevance stays NOT CHECKED.
+the citation is accurate or that the code supports the statement. Since M2.4 every citation is
+then checked by the [citation verifier](citation-check.md) (file, lines, quoted code), which
+adds `checked_claims`. Relevance stays NOT CHECKED.
 
 ## Command line
 
@@ -99,7 +100,7 @@ an observation, not a checker.
 
 ## Not done in M2.3
 
-* No citation verification (M2.4) and no injection test suite (M2.5).
+* No injection test suite (M2.5). Citation checks: see [citation-check.md](citation-check.md).
 * One retrieval pass and one model call: no query rewriting, no follow-up retrieval.
 * `/v2/repo/ask` is synchronous; it is not available as a background job.
 * The model sees only excerpts; it cannot open other files.
