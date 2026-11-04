@@ -12,7 +12,8 @@ import re
 from typing import Any
 
 from cpu_first.core import (
-    LocalLlama, InvalidExpression, InvalidModelOutput, exact_arithmetic, formatted_fraction, solve, json_object,
+    LocalLlama, InvalidExpression, InvalidModelOutput, ModelError, exact_arithmetic, formatted_fraction,
+    solve, json_object,
 )
 from .grounding import check_numeric_grounding
 from .proof import verify_plan
@@ -51,7 +52,31 @@ PROOF_REPAIR_PROMPT = PROOF_PROMPT + "\nPrevious plan failed validation. Return 
 
 
 class UpstreamUnavailable(Exception):
-    """Local model could not be reached or produced an invalid API response."""
+    """Local model could not be reached (refused, timeout, HTTP 5xx). Retryable."""
+    code = "local_model_unavailable"
+    retryable = True
+
+
+class UpstreamFailed(Exception):
+    """The local model server answered but cannot serve this: wrong model loaded, request
+    rejected (4xx), malformed response. Retrying the same request will not help."""
+    retryable = False
+
+    def __init__(self, code: str, message: str, http_status: int = 502):
+        super().__init__(message)
+        self.code, self.http_status = code, http_status
+
+
+def upstream_error(exc: ModelError) -> Exception:
+    """Map a classified model-client error onto the engine's two upstream outcomes."""
+    if exc.retryable:
+        return UpstreamUnavailable(str(exc))
+    return UpstreamFailed(exc.code, str(exc), 503 if exc.code == "local_model_mismatch" else 502)
+
+
+# Exceptions a model call may legitimately raise. Anything else is a NOEMA bug and must
+# propagate (to the API's catch-all 500), not be reported as a retryable outage (audit G3).
+PASS_THROUGH = (UpstreamUnavailable, UpstreamFailed, ValueError)
 
 
 @dataclass(frozen=True)
@@ -62,8 +87,12 @@ class Settings:
 
 
 class LazyLocalModel:
-    """Connects only to loopback llama.cpp process and retries after startup."""
-    def __init__(self, url: str = "http://127.0.0.1:8080"):
+    """Connects only to loopback llama.cpp process and retries after startup.
+
+    With an ``expectation`` (M1.4), the served model's identity, context size and optional
+    file hash are checked on every (re)connect, before any request is answered.
+    """
+    def __init__(self, url: str = "http://127.0.0.1:8080", expectation=None):
         from urllib.parse import urlparse
         parsed = urlparse(url)
         if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
@@ -71,6 +100,9 @@ class LazyLocalModel:
                 or parsed.path not in ("", "/")):
             raise ValueError("Model URL must be a loopback HTTP origin")
         self.url = url.rstrip("/")
+        self.expectation = expectation
+        self.identity = None          # ModelIdentity once a connect has been verified
+        self.last_problems: list[str] = []
         self._model: LocalLlama | None = None
         self._lock = Lock()
 
@@ -78,26 +110,40 @@ class LazyLocalModel:
         if self._model is None:
             with self._lock:
                 if self._model is None:
-                    self._model = LocalLlama(self.url)
+                    model = LocalLlama(self.url)
+                    if self.expectation is not None:
+                        from .model_adapter import verify
+                        try:
+                            self.identity = verify(self.url, self.expectation)
+                        except ModelError as exc:
+                            self.last_problems = list(getattr(exc, "problems", [str(exc)]))
+                            raise
+                        self.last_problems = []
+                    self._model = model
         return self._model
+
+    @property
+    def model(self) -> str | None:
+        return self._model.model if self._model is not None else None
 
     def chat(self, prompt: str, question: str, max_tokens: int = 256, **sampling):
         try:
             return self._get_model().chat(prompt, question, max_tokens=max_tokens, **sampling)
-        except Exception as exc:
+        except ModelError as exc:
             with self._lock:
-                self._model = None
-            raise UpstreamUnavailable("Local model inference unavailable") from exc
+                self._model = None    # reconnect (and re-verify) next time
+            raise upstream_error(exc) from exc
 
     def ready(self) -> bool:
         try:
             self._get_model()
-            from urllib.request import Request, urlopen
-            from cpu_first.core import model_server_headers
-            with urlopen(Request(self.url + "/v1/models", headers=model_server_headers()),
-                         timeout=2) as response:
-                return response.status == 200
-        except Exception:
+            from urllib.request import Request
+            from cpu_first.core import model_http_json, model_server_headers
+            model_http_json(Request(self.url + "/v1/models", headers=model_server_headers()), 2)
+            return True
+        except ModelError:
+            with self._lock:
+                self._model = None
             return False
 
 
@@ -180,10 +226,10 @@ class ReasoningEngine:
                 result = solve(self.model, text, "hybrid" if current == "repair" else current,
                                max_tokens=self.settings.max_output_tokens_per_call,
                                system_prompt=system_prompt, user_prompt=user_prompt)
-            except UpstreamUnavailable:
+            except PASS_THROUGH:
                 raise
-            except Exception as exc:
-                raise UpstreamUnavailable("Local model call failed") from exc
+            except ModelError as exc:
+                raise upstream_error(exc) from exc
             usage["model_calls"] += 1
             usage["prompt_tokens"] += result["prompt_tokens"] or 0
             usage["completion_tokens"] += result["completion_tokens"] or 0
@@ -211,10 +257,10 @@ class ReasoningEngine:
                 try:
                     completion = self.model.chat(prompt, question_for_model,
                                                  max_tokens=max(512, self.settings.max_output_tokens_per_call))
-                except UpstreamUnavailable:
+                except PASS_THROUGH:
                     raise
-                except Exception as exc:
-                    raise UpstreamUnavailable("Local model call failed") from exc
+                except ModelError as exc:
+                    raise upstream_error(exc) from exc
                 usage["model_calls"] += 1
                 usage["prompt_tokens"] += completion.prompt_tokens or 0
                 usage["completion_tokens"] += completion.completion_tokens or 0

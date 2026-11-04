@@ -14,8 +14,14 @@ from cpu_platform.server import create_server
 
 
 class FakeModel:
+    """An unreachable model server. M1.4: it must raise the client's transport error; a
+    model object without chat() is a NOEMA bug, no longer reported as an outage (audit G3)."""
     def ready(self):
         return False
+
+    def chat(self, *args, **kwargs):
+        from cpu_first.core import ModelTransportError
+        raise ModelTransportError("Local model server unreachable: connection refused")
 
 
 class TestJobStore(unittest.TestCase):

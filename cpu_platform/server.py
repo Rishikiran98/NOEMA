@@ -12,13 +12,14 @@ import json
 import logging
 import os
 import re
+import sys
 from secrets import token_hex
 from threading import BoundedSemaphore
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit
 
-from .engine import LazyLocalModel, ReasoningEngine, UpstreamUnavailable
+from .engine import LazyLocalModel, ReasoningEngine, UpstreamFailed, UpstreamUnavailable
 from .proof import verify_plan
 from .semantic import verify_semantic_plan
 from .general import GeneralReasoner
@@ -249,9 +250,16 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             return
         if self.path == "/readyz":
-            ready = bool(self.server.engine.model.ready()) if hasattr(self.server.engine.model, "ready") else True
-            return self._send(200 if ready else 503,
-                              {"model_ready": ready, "async_jobs_enabled": self.server.jobs is not None})
+            model = self.server.engine.model
+            ready = bool(model.ready()) if hasattr(model, "ready") else True
+            body = {"model_ready": ready, "async_jobs_enabled": self.server.jobs is not None}
+            if getattr(model, "expectation", None) is not None:
+                body["model_expected"] = model.expectation.label
+                body["model_problems"] = list(getattr(model, "last_problems", []))
+                identity = getattr(model, "identity", None)
+                if identity is not None:
+                    body["model"] = {"id": identity.id, "n_ctx": identity.n_ctx}
+            return self._send(200 if ready else 503, body)
         if self.path == "/v1/metrics":
             data = self.server.metrics.snapshot()
             if self.server.jobs:
@@ -364,6 +372,10 @@ class Handler(BaseHTTPRequestHandler):
             except UpstreamUnavailable:
                 status = "upstream_unavailable"
                 return self._send(503, {"error": "local_model_unavailable", "retryable": True})
+            except UpstreamFailed as exc:
+                # Wrong model, rejected request or malformed reply: retrying will not help.
+                status = "upstream_failed"
+                return self._send(exc.http_status, {"error": exc.code, "retryable": False})
             result["request_id"] = token_hex(8)
             result["version"] = __version__
             status, route = result["status"], result["route"] or "unknown"
@@ -377,6 +389,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def create_server(port: int = 8070, *, engine: ReasoningEngine | None = None,
                   api_key: str = "", max_inflight: int = 2, model_url: str = "http://127.0.0.1:8080",
+                  model_expectation=None,
                   api_keys: dict[str, str] | None = None,
                   jobs_db: str | None = None, job_workers: int = 1,
                   max_queued: int = 32, max_per_tenant: int = 8,
@@ -384,11 +397,27 @@ def create_server(port: int = 8070, *, engine: ReasoningEngine | None = None,
                   allowed_hosts: tuple[str, ...] = ()) -> App:
     if max_inflight < 1 or max_inflight > 128:
         raise ValueError("max_inflight must be between 1 and 128")
-    engine = engine or ReasoningEngine(LazyLocalModel(model_url))
+    engine = engine or ReasoningEngine(LazyLocalModel(model_url, expectation=model_expectation))
     return App(("127.0.0.1", port), engine, api_key=api_key, max_inflight=max_inflight,
                api_keys=api_keys, jobs_db=jobs_db, job_workers=job_workers,
                max_queued=max_queued, max_per_tenant=max_per_tenant, job_ttl_hours=job_ttl_hours,
                max_submissions_per_hour=max_submissions_per_hour, allowed_hosts=allowed_hosts)
+
+
+def check_model_at_startup(model: LazyLocalModel) -> str | None:
+    """Verify the expected model now. A mismatch is fatal; an unreachable model server is
+    not (it may still be loading), and the check then runs on the first connect."""
+    from cpu_first.core import ModelError, ModelTransportError
+    try:
+        model._get_model()
+    except ModelTransportError:
+        return ("WARNING: model server not reachable yet; the expected model "
+                f"({model.expectation.label}) will be checked on first use.")
+    except ModelError as exc:
+        details = getattr(exc, "problems", None) or [str(exc)]
+        return "ERROR: refusing to serve:\n  " + "\n  ".join(details)
+    identity = model.identity
+    return (f"Model check passed: {identity.id} (n_ctx {identity.n_ctx})." if identity else None)
 
 
 def main():
@@ -405,8 +434,23 @@ def main():
     parser.add_argument("--allowed-host", action="append", default=[], metavar="HOSTNAME",
                         help="extra Host/Origin hostname to accept (e.g. a local TLS reverse proxy's "
                              "name); loopback names are always accepted; repeatable")
+    parser.add_argument("--expect-model", metavar="PRESET|FRAGMENTS",
+                        help="refuse to serve unless the loaded model matches: a launcher preset name "
+                             "(also checks its context size and thinking support) or comma-separated "
+                             "name fragments")
+    parser.add_argument("--min-ctx", type=int, help="minimum context size the model server must have")
+    parser.add_argument("--expect-sha256", help="SHA256 of the GGUF file the server must have loaded")
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    expectation = None
+    if args.expect_model or args.min_ctx or args.expect_sha256:
+        from .model_adapter import ModelExpectation, parse_expectation
+        try:
+            expectation = (parse_expectation(args.expect_model, min_ctx=args.min_ctx, sha256=args.expect_sha256)
+                           if args.expect_model else
+                           ModelExpectation(min_ctx=args.min_ctx, sha256=args.expect_sha256, label="custom"))
+        except ValueError as exc:
+            parser.error(str(exc))
     keys_raw = os.environ.get("CPU_REASONING_API_KEYS_JSON", "")
     api_keys = json.loads(keys_raw) if keys_raw else None
     server = create_server(args.port, model_url=args.model_url,
@@ -415,11 +459,18 @@ def main():
                            job_workers=args.job_workers, max_queued=args.max_queued,
                            max_per_tenant=args.max_per_tenant, job_ttl_hours=args.job_ttl_hours,
                            max_submissions_per_hour=args.max_submissions_per_hour,
-                           allowed_hosts=tuple(args.allowed_host))
+                           allowed_hosts=tuple(args.allowed_host), model_expectation=expectation)
     print(f"CPU reasoning preview http://127.0.0.1:{server.server_port}")
     print("Use GET /healthz, POST /v1/reason and /v1/ask; model runs separately on loopback")
     if not server.api_keys:
         print("No API key configured. Loopback only. Do not publicly expose this service.")
+    if expectation is not None:
+        status = check_model_at_startup(server.engine.model)
+        if status is not None:
+            print(status, file=sys.stderr)
+            if status.startswith("ERROR"):
+                server.server_close()
+                raise SystemExit(2)
     if server.jobs:
         print("Durable jobs enabled: prompts and results stored as plaintext on local disk.")
     try:

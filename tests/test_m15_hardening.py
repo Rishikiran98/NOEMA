@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 from urllib.error import HTTPError
 
-from cpu_first.core import LLAMA_API_KEY_ENV, LocalLlama
+from cpu_first.core import LLAMA_API_KEY_ENV, LocalLlama, ModelRejectedRequest
 from cpu_platform import launch
 from cpu_platform.engine import LazyLocalModel
 from cpu_platform.provenance import server_props
@@ -204,9 +204,12 @@ class ModelServerApiKey(unittest.TestCase):
 
     def test_client_without_key_is_refused(self):
         with mock.patch.dict(os.environ, {LLAMA_API_KEY_ENV: ""}):
-            with self.assertRaises(HTTPError) as caught:
+            # M1.4: a 4xx is classified as a non-retryable rejected request (was a raw HTTPError).
+            with self.assertRaises(ModelRejectedRequest) as caught:
                 LocalLlama(self.fake.url)
-        self.assertEqual(caught.exception.code, 401)
+        self.assertEqual(caught.exception.status, 401)
+        self.assertFalse(caught.exception.retryable)
+        self.assertIsInstance(caught.exception.__cause__, HTTPError)
 
     def test_client_with_key_connects_and_chats(self):
         with mock.patch.dict(os.environ, {LLAMA_API_KEY_ENV: self.KEY}):

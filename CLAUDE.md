@@ -78,6 +78,7 @@ numbers, line counts or test counts.
 | `cpu_platform/logic.py` | exact propositional entailment checker |
 | `cpu_platform/experiment6.py`, `report.py` | paired matched-compute experiments and reports |
 | `cpu_platform/datasets.py`, `provenance.py` | frozen splits, leak guard, model hashes, evidence table |
+| `cpu_platform/model_adapter.py` | checks the served model's identity, context and hash before serving (`--expect-model`); model-error classes live in `cpu_first/core.py` |
 | `cpu_platform/launch.py`, `hardware.py` | hardware-aware CPU-only llama.cpp launcher |
 | `cpu_platform/jobs.py` | SQLite job queue |
 | `tests/fake_llama.py` | offline stand-in for llama.cpp's HTTP API (not a model) |

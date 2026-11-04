@@ -36,6 +36,77 @@ def hybrid_thinking(model_name: str) -> bool:
     return "qwen3" in name and not any(marker in name for marker in NON_HYBRID_QWEN3_MARKERS)
 
 
+def thinking_support(model_name: str) -> bool | None:
+    """True: per-request thinking works. False: known NOT to (requests for it are refused).
+    None: unknown model family; thinking switches are passed through as before."""
+    if hybrid_thinking(model_name):
+        return True
+    name = model_name.lower()
+    if "qwen3" in name or "qwen2.5" in name or "qwen2_5" in name:
+        return False
+    return None
+
+
+class ModelError(RuntimeError):
+    """A model-server call failed. ``retryable`` says whether trying again can help.
+
+    Subclasses RuntimeError so callers written against the v0.x client keep working.
+    Programming errors in NOEMA itself are never wrapped in a ModelError (audit G3).
+    """
+    code = "model_error"
+    retryable = False
+
+
+class ModelTransportError(ModelError):
+    """Connection refused or reset, timeout, or HTTP 5xx: the server is down, busy or loading."""
+    code = "local_model_unavailable"
+    retryable = True
+
+
+class ModelRejectedRequest(ModelError):
+    """HTTP 4xx: the server refused this request (bad API key, prompt too long, bad field)."""
+    code = "local_model_rejected_request"
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+class ModelProtocolError(ModelError):
+    """The server answered, but not in the llama.cpp/OpenAI shape this client expects."""
+    code = "local_model_bad_response"
+
+
+class ModelMismatch(ModelError):
+    """The loaded model is not the one the operator asked for (identity, context, hash)."""
+    code = "local_model_mismatch"
+
+    def __init__(self, problems: list[str]):
+        super().__init__("; ".join(problems))
+        self.problems = list(problems)
+
+
+def model_http_json(request, timeout: float) -> dict:
+    """Perform one model-server HTTP call and classify every failure as a ModelError."""
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            body = response.read()
+    except HTTPError as exc:
+        detail = f"HTTP {exc.code} from local model server"
+        if exc.code >= 500:
+            raise ModelTransportError(detail) from exc
+        raise ModelRejectedRequest(detail, exc.code) from exc
+    except (URLError, TimeoutError, OSError) as exc:  # refused, reset, DNS, socket timeout
+        raise ModelTransportError(f"Local model server unreachable: {exc}") from exc
+    try:
+        data = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ModelProtocolError("Local model server returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise ModelProtocolError("Local model server returned a non-object JSON body")
+    return data
+
+
 class InvalidExpression(ValueError):
     pass
 
@@ -195,15 +266,24 @@ class LocalLlama:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         models = self._get("/v1/models")
-        available = models.get("data", [])
+        available = models.get("data")
+        if not isinstance(available, list):
+            raise ModelProtocolError("/v1/models has no 'data' list")
         if not available:
-            raise RuntimeError("Server returned no model. Load a local GGUF model first.")
+            raise ModelProtocolError("Server returned no model. Load a local GGUF model first.")
+        if not isinstance(available[0], dict) or not isinstance(available[0].get("id"), str):
+            raise ModelProtocolError("/v1/models entry has no string 'id'")
         self.model = available[0]["id"]
+        # llama-server serves one model; a list of several means a router or proxy is in
+        # front of it, and data[0] may not be the model that answers (audit G5).
+        self.model_count = len(available)
 
     def _get(self, endpoint: str) -> dict:
-        with urlopen(Request(self.base_url + endpoint, headers=model_server_headers()),
-                     timeout=15) as response:
-            return json.load(response)
+        return model_http_json(Request(self.base_url + endpoint, headers=model_server_headers()), 15)
+
+    @property
+    def thinking_supported(self) -> bool | None:
+        return thinking_support(self.model)
 
     @property
     def disables_thinking(self) -> bool:
@@ -221,6 +301,8 @@ class LocalLlama:
             raise ValueError("temperature must be between 0 and 2")
         if reasoning_budget is not None and not 0 <= reasoning_budget <= 32768:
             raise ValueError("reasoning_budget must be 0..32768 tokens")
+        if thinking and self.thinking_supported is False:
+            raise ValueError(f"model {self.model!r} does not support per-request thinking")
         if thinking is None and self.disables_thinking:
             thinking = False
         system = prompt + ("\n/no_think" if self.disables_thinking and not thinking else "")
@@ -252,16 +334,20 @@ class LocalLlama:
             method="POST",
         )
         start = time.perf_counter()
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                result = json.load(response)
-        except (URLError, HTTPError, TimeoutError) as exc:
-            raise RuntimeError(f"Local inference request failed: {exc}") from exc
+        result = model_http_json(request, self.timeout)
         latency = time.perf_counter() - start
-        message = result["choices"][0]["message"]
-        embedded, content = split_thinking(message.get("content") or "")
-        reasoning = (message.get("reasoning_content") or "").strip() or embedded or None
-        usage = result.get("usage", {})
+        try:
+            message = result["choices"][0]["message"]
+            content_text = message.get("content") or ""
+            reasoning_text = message.get("reasoning_content") or ""
+            usage = result.get("usage") or {}
+            if not (isinstance(content_text, str) and isinstance(reasoning_text, str)
+                    and isinstance(usage, dict)):
+                raise TypeError("unexpected field types")
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise ModelProtocolError("Chat completion response has no choices[0].message") from exc
+        embedded, content = split_thinking(content_text)
+        reasoning = reasoning_text.strip() or embedded or None
         return Completion(content, latency, usage.get("prompt_tokens"), usage.get("completion_tokens"),
                           reasoning)
 
