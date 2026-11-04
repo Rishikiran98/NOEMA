@@ -1,2 +1,4 @@
 # Retrieval evaluation questions: never index them, or each question would match itself.
 data/retrieval/
+# Prompt-injection fixtures (M2.5): adversarial on purpose; never index them as NOEMA code.
+data/injection/
