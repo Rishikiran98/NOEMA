@@ -58,12 +58,15 @@ of the index so no question can match its own text.
 | dev (20) | plain BM25 (no weights, no bonus, no cap) | 0.35 | 0.80 | 0.85 | 0.53 |
 | dev (20) | initial weights, roles 1.0 | 0.35 | 0.85 | 0.95 | 0.51 |
 | dev (20) | **frozen: + docs/tests × 0.6** | **0.75** | **0.95** | **0.95** | **0.82** |
-| eval (20) | frozen | NOT RUN (awaiting approval) | | | |
+| **eval (20, held out)** | frozen, run once 2026-11-04 at `978a353` | **0.70** | **0.95** | **0.95** | **0.80** |
 
 Dev numbers are tuned on, so they overstate quality. The questions were written by the same
 author as the code changes, who knows the codebase: they are easier than real user questions.
 The one dev miss (q39) asks about `tests/fake_llama.py`, which the test-file weighting pushes
-down.
+down. The one held-out miss (q25, "where is the bearer token compared in constant time?") shows
+the lexical limit: `server.py` does it with `hmac.compare_digest` and never says "constant time".
+The held-out run was approved by the user and is logged in `data/retrieval/eval_runs.jsonl`; that
+split is now spent for tuning purposes.
 
 ## Not done in M2.2
 
@@ -71,4 +74,4 @@ down.
 * Postings are rebuilt in memory per `Retriever`; fine for NOEMA-sized repositories (~1,200
   chunks in well under a second here), not measured on large ones.
 * Call sites are name-based, not type-resolved; no "find callers of this exact method".
-* Held-out eval split: NOT RUN. Laptop timing: NOT RUN.
+* Laptop timing: NOT RUN. A fresh held-out set is needed before any further tuning claim.
