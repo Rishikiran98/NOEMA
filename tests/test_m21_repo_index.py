@@ -130,7 +130,11 @@ class IgnoreRules(unittest.TestCase):
     @unittest.skipIf(GIT is None or not (REPO_ROOT / ".git").exists(), "not a git checkout")
     def test_noema_itself_matches_git(self):
         ours = {item[0] for item in ri.iter_files(REPO_ROOT) if item[0] != "<skip>"}
-        listed = subprocess.run([GIT, "-C", str(REPO_ROOT), "ls-files", "-co", "--exclude-standard"],
+        # NOEMA's own .noemaignore (root level only) is passed to git too, so git still
+        # supplies the expected file set (M2.2 added it to keep eval questions unindexed).
+        noemaignore = REPO_ROOT / ".noemaignore"
+        extra = [f"--exclude-from={noemaignore}"] if noemaignore.is_file() else []
+        listed = subprocess.run([GIT, "-C", str(REPO_ROOT), "ls-files", "-co", "--exclude-standard", *extra],
                                 capture_output=True, text=True, check=True).stdout.split()
         self.assertEqual(ours, set(listed))
 

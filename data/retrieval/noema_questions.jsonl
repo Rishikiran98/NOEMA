@@ -1,0 +1,40 @@
+{"id": "q01", "split": "eval", "question": "How does the API stop DNS rebinding attacks from web pages?", "gold_files": ["cpu_platform/server.py"]}
+{"id": "q02", "split": "eval", "question": "Where is a gitignore pattern translated into a regular expression?", "gold_files": ["cpu_platform/ignore.py"]}
+{"id": "q03", "split": "dev", "question": "Which files are skipped because they probably contain secrets?", "gold_files": ["cpu_platform/repo_index.py"]}
+{"id": "q04", "split": "eval", "question": "How is the KV cache size counted when deciding whether a model fits in RAM?", "gold_files": ["cpu_platform/hardware.py"]}
+{"id": "q05", "split": "eval", "question": "What happens when the llama.cpp server returns HTTP 503?", "gold_files": ["cpu_first/core.py"]}
+{"id": "q06", "split": "eval", "question": "How does the launcher check that the llama.cpp API key is really enforced?", "gold_files": ["cpu_platform/launch.py"]}
+{"id": "q07", "split": "dev", "question": "Where are GPUs hidden from the llama.cpp process?", "gold_files": ["cpu_platform/launch.py"]}
+{"id": "q08", "split": "eval", "question": "How are arithmetic expressions evaluated without using eval?", "gold_files": ["cpu_first/core.py"]}
+{"id": "q09", "split": "dev", "question": "How does the propositional logic checker decide entailment?", "gold_files": ["cpu_platform/logic.py"]}
+{"id": "q10", "split": "dev", "question": "Where are the frozen dev and eval splits created?", "gold_files": ["cpu_platform/datasets.py"]}
+{"id": "q11", "split": "dev", "question": "How are copied evaluation questions detected even when their ids change?", "gold_files": ["cpu_platform/datasets.py"]}
+{"id": "q12", "split": "dev", "question": "How does the job queue stop two processes from using the same database?", "gold_files": ["cpu_platform/jobs.py"]}
+{"id": "q13", "split": "eval", "question": "What happens to a job that was running when the process crashed?", "gold_files": ["cpu_platform/jobs.py"]}
+{"id": "q14", "split": "eval", "question": "How is the SHA256 of the loaded model file computed and cached?", "gold_files": ["cpu_platform/provenance.py"]}
+{"id": "q15", "split": "eval", "question": "Where is the Markdown report for an experiment written?", "gold_files": ["cpu_platform/report.py"]}
+{"id": "q16", "split": "eval", "question": "How are equations in the model's reasoning text checked?", "gold_files": ["cpu_platform/cot_check.py"]}
+{"id": "q17", "split": "dev", "question": "Where is the check that the served model has a large enough context window?", "gold_files": ["cpu_platform/model_adapter.py"]}
+{"id": "q18", "split": "eval", "question": "How are unknown fields in an EngineRequest rejected?", "gold_files": ["cpu_platform/contract.py"]}
+{"id": "q19", "split": "dev", "question": "Which rule stops the dev sandbox backend claiming to be a security boundary?", "gold_files": ["cpu_platform/contract.py"]}
+{"id": "q20", "split": "dev", "question": "How does the /v1/ask route pick a domain for a question?", "gold_files": ["cpu_platform/general.py"]}
+{"id": "q21", "split": "eval", "question": "How are Python files split into chunks by function and class?", "gold_files": ["cpu_platform/repo_index.py"]}
+{"id": "q22", "split": "eval", "question": "How does incremental re-indexing avoid re-reading unchanged files?", "gold_files": ["cpu_platform/repo_index.py"]}
+{"id": "q23", "split": "dev", "question": "How are physical CPU cores counted on Linux?", "gold_files": ["cpu_platform/hardware.py"]}
+{"id": "q24", "split": "eval", "question": "How does the server limit the size of a request body?", "gold_files": ["cpu_platform/server.py"]}
+{"id": "q25", "split": "eval", "question": "Where is the bearer token compared in constant time?", "gold_files": ["cpu_platform/server.py"]}
+{"id": "q26", "split": "dev", "question": "Which function decides whether a Qwen model supports per-request thinking?", "gold_files": ["cpu_first/core.py"]}
+{"id": "q27", "split": "dev", "question": "How does the semantic plan verifier recognise word-problem templates?", "gold_files": ["cpu_platform/semantic.py"]}
+{"id": "q28", "split": "dev", "question": "How is a proof plan validated step by step?", "gold_files": ["cpu_platform/proof.py"]}
+{"id": "q29", "split": "eval", "question": "How does the matched-compute experiment refuse to run on the frozen eval split?", "gold_files": ["cpu_platform/experiment6.py"]}
+{"id": "q30", "split": "dev", "question": "How are numbers in a model's expression checked against the question text?", "gold_files": ["cpu_platform/grounding.py"]}
+{"id": "q31", "split": "eval", "question": "Where is sampling several answers and taking a majority vote implemented?", "gold_files": ["cpu_platform/search.py"]}
+{"id": "q32", "split": "eval", "question": "How is the GSM8K dataset downloaded and its provenance recorded?", "gold_files": ["scripts/fetch_gsm8k.py"]}
+{"id": "q33", "split": "eval", "question": "How does the Python client submit an async job and wait for the result?", "gold_files": ["cpu_platform/client.py"]}
+{"id": "q34", "split": "dev", "question": "How are request metrics such as in-flight count and latency tracked?", "gold_files": ["cpu_platform/metrics.py"]}
+{"id": "q35", "split": "eval", "question": "Where are grammar-constrained plans generated with a GBNF grammar?", "gold_files": ["cpu_platform/constrained.py"]}
+{"id": "q36", "split": "dev", "question": "What message is sent to the model when its thinking budget runs out?", "gold_files": ["cpu_first/core.py"]}
+{"id": "q37", "split": "dev", "question": "Where are model presets like qwen3-coder-30b-a3b defined?", "gold_files": ["cpu_platform/hardware.py"]}
+{"id": "q38", "split": "dev", "question": "How are model server errors turned into HTTP 502 or 503 responses?", "gold_files": ["cpu_platform/engine.py", "cpu_platform/server.py"]}
+{"id": "q39", "split": "dev", "question": "How does the fake llama server simulate thinking output in tests?", "gold_files": ["tests/fake_llama.py"]}
+{"id": "q40", "split": "dev", "question": "What does the CI workflow run on Windows and Linux?", "gold_files": [".github/workflows/ci.yml"]}
