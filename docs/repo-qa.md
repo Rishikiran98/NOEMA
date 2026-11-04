@@ -100,7 +100,7 @@ an observation, not a checker.
 
 ## Not done in M2.3
 
-* No injection test suite (M2.5). Citation checks: see [citation-check.md](citation-check.md).
+* Injection hardening: see [injection.md](injection.md). Citation checks: see [citation-check.md](citation-check.md).
 * One retrieval pass and one model call: no query rewriting, no follow-up retrieval.
 * `/v2/repo/ask` is synchronous; it is not available as a background job.
 * The model sees only excerpts; it cannot open other files.
