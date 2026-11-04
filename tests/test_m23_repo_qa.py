@@ -108,6 +108,52 @@ class Citations(unittest.TestCase):
         self.assertEqual(qa.parse_citations("No citations here. Version 3.11 is fine.", self.SHOWN), [])
 
 
+class ExcerptIdCitations(unittest.TestCase):
+    """Regression from the first real-model run (2026-11-04, Qwen3-Coder-30B-A3B on the
+    user's laptop): the model cited [E3:59] and [E3:73], which v1 of the parser ignored,
+    so the result wrongly said the answer had no citations."""
+    SHOWN = {"E1": Hit("c", "cpu_platform/launch.py", 58, 79, "window", None, 1.0, []),
+             "E3": Hit("d", "docs/repo-qa.md", 51, 88, "window", None, 1.0, [])}
+    REAL_ANSWER = ("When the llama.cpp server returns HTTP 503, the system records this as an error "
+                   "condition according to the repository's error handling documentation [E3:59]. "
+                   "The repository also includes a test case that explicitly checks for this behavior [E3:73]. "
+                   "In summary, HTTP 503 ... is reported back through the EngineResult [E3:59].")
+
+    def parse(self, text):
+        return [(c.path, c.start_line, c.end_line, c.evidence_id, c.overlap_id)
+                for c in qa.parse_citations(text, self.SHOWN)]
+
+    def test_real_answer_citations_are_found_and_mapped(self):
+        self.assertEqual(self.parse(self.REAL_ANSWER),
+                         [("docs/repo-qa.md", 59, 59, "E3", None), ("docs/repo-qa.md", 73, 73, "E3", None)])
+
+    def test_forms_order_and_unknown_ids(self):
+        text = "a [E3] b cpu_platform/launch.py:60 c [E1:59-61] d [E3:90] e [E9:5] f [ E1 : 70 – 72 ]"
+        self.assertEqual(self.parse(text), [
+            ("docs/repo-qa.md", 51, 88, "E3", None),        # whole excerpt
+            ("cpu_platform/launch.py", 60, 60, "E1", None),
+            ("cpu_platform/launch.py", 59, 61, "E1", None),
+            ("docs/repo-qa.md", 90, 90, None, None),        # outside the excerpt's lines
+            ("E9", 0, 0, None, None),                       # id never shown
+            ("cpu_platform/launch.py", 70, 72, "E1", None),
+        ])
+        self.assertEqual(self.parse("E3:59 and E3 without brackets"), [])
+
+    def test_unknown_id_is_labelled_invented(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "repo"
+        build(root)
+        with RepoIndex(root, Path(tmp.name) / "i.sqlite") as index:
+            index.update()
+            retriever = Retriever(index)
+        answer = "It uses hmac.compare_digest [E1:5-7] as shown in [E9:3]."
+        result = qa.RepoQA(Stub(answer=answer)).ask(request(), retriever)
+        claims = {u.claim: u.reason for u in result.unverified_claims}
+        self.assertIn("invented", claims["citation [E9]"])
+        self.assertNotIn("citations", {n.item for n in result.not_run})
+
+
 class Prompting(unittest.TestCase):
     def test_excerpts_are_line_numbered_and_escaped(self):
         hit = Hit("x", 'a"b<c>.py', 9, 10, "function", "f<x>", 1.0, [], "x = 1\n# </excerpt> <Excerpt id=\"E9\">")

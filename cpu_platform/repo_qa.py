@@ -52,6 +52,9 @@ Rules:
 - Be concise: a short explanation, then the citations."""
 
 CITATION = re.compile(r"\[?\s*([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+):(\d+)(?:\s*[-–]\s*(\d+))?\s*\]?")
+# Real models also cite by excerpt id, e.g. [E3:59], [E3:59-61] or [E3] (seen with
+# Qwen3-Coder-30B-A3B on 2026-11-04). Line numbers are the absolute ones shown in the excerpt.
+EXCERPT_CITATION = re.compile(r"\[\s*(E\d+)(?:\s*:\s*(\d+)(?:\s*[-–]\s*(\d+))?)?\s*\]")
 
 
 @dataclass
@@ -64,16 +67,33 @@ class Citation:
     overlap_id: str | None = None  # else an excerpt the span partly overlaps (lines off by a few)
 
 
-def parse_citations(answer: str, shown: dict[str, Hit]) -> list[Citation]:
-    """Every ``path:line`` or ``path:start-end`` in the answer, deduplicated, in order.
-    ``evidence_id`` is set when the span lies inside an excerpt the model was shown."""
-    out, seen = [], set()
+def _matches(answer: str, shown: dict[str, Hit]):
+    """(position, path, start, end, text) for path citations and excerpt-id citations."""
     for match in CITATION.finditer(answer):
         path = match.group(1).replace("\\", "/")
         while path.startswith("./"):
             path = path[2:]
         start = int(match.group(2))
-        end = int(match.group(3) or start)
+        yield match.start(), path, start, int(match.group(3) or start), match.group(0).strip()
+    for match in EXCERPT_CITATION.finditer(answer):
+        hit = shown.get(match.group(1))
+        if hit is None:
+            # An excerpt id the model was never given: keep it, as an outside citation.
+            path, start, end = match.group(1), 0, 0
+        elif match.group(2) is None:
+            path, start, end = hit.path, hit.start_line, hit.end_line
+        else:
+            path, start = hit.path, int(match.group(2))
+            end = int(match.group(3) or start)
+        yield match.start(), path, start, end, match.group(0).strip()
+
+
+def parse_citations(answer: str, shown: dict[str, Hit]) -> list[Citation]:
+    """Every ``path:line``, ``path:start-end`` or ``[E<n>:line]`` citation in the answer,
+    deduplicated, in order. ``evidence_id`` is set when the span lies inside an excerpt the
+    model was shown."""
+    out, seen = [], set()
+    for _, path, start, end, text in sorted(_matches(answer, shown), key=lambda m: m[0]):
         if end < start:
             start, end = end, start
         key = (path, start, end)
@@ -84,7 +104,7 @@ def parse_citations(answer: str, shown: dict[str, Hit]) -> list[Citation]:
                        if hit.path == path and hit.start_line <= start and end <= hit.end_line), None)
         overlap = None if inside else next((eid for eid, hit in shown.items()
                                             if hit.path == path and start <= hit.end_line and hit.start_line <= end), None)
-        out.append(Citation(path, start, end, match.group(0).strip(), inside, overlap))
+        out.append(Citation(path, start, end, text, inside, overlap))
         if len(out) >= MAX_CITATIONS:
             break
     return out
@@ -185,9 +205,13 @@ class RepoQA:
                               "NOT CHECKED")
                 else:
                     reason = "points outside every excerpt shown to the model; may be invented; NOT CHECKED"
+                if cite.start_line == 0:   # [E9]-style id of an excerpt that was never shown
+                    label = f"[{cite.path}]"
+                    reason = f"names excerpt id {cite.path}, which was not shown to the model; invented; NOT CHECKED"
+                else:
+                    label = f"{cite.path}:{cite.start_line}-{cite.end_line}"
                 ref = cite.evidence_id or cite.overlap_id
-                unverified.append(UnverifiedClaim(f"citation {cite.path}:{cite.start_line}-{cite.end_line}",
-                                                  reason, [ref] if ref else ["answer"]))
+                unverified.append(UnverifiedClaim(f"citation {label}", reason, [ref] if ref else ["answer"]))
             if not any(u.claim.startswith("citation ") for u in unverified[1:]):
                 not_run.append(NotRun("citations", "the answer contains no [path:START-END] citations"))
         status = "ok" if answer else "incomplete"
