@@ -156,7 +156,10 @@ def _copy_repository(src: Path, dst: Path) -> dict[str, str]:
     """Copy files the index would consider (ignored, secret-named, symlinked and oversized
     files are left out). Returns {relative path: sha256} of what was copied."""
     copied = {}
-    for item in iter_files(src):
+    # .gitignore rules apply; .noemaignore does not (it only keeps files out of NOEMA's
+    # index, and a repository's tests may need them). HOME/TEMP live beside the copy, never
+    # inside it, so a sandbox started inside a sandbox cannot copy itself.
+    for item in iter_files(src, extra_ignore_file=None):
         if item[0] == "<skip>":
             continue
         rel, info = item
@@ -174,7 +177,7 @@ def _snapshot(root: Path) -> dict[str, str]:
     for path in root.rglob("*"):
         if path.is_file() and not path.is_symlink():
             rel = path.relative_to(root).as_posix()
-            if rel.split("/", 1)[0] in (".sandbox-home", ".sandbox-tmp") or "__pycache__" in rel.split("/"):
+            if "__pycache__" in rel.split("/"):
                 continue
             out[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
     return out
@@ -193,8 +196,12 @@ class Sandbox:
         self.root = self._tmp / "repo"
         self.root.mkdir()
         self.copied = _copy_repository(self.repo, self.root)
-        for name in (".sandbox-home", ".sandbox-tmp"):
-            (self.root / name).mkdir()
+        # HOME and TEMP are siblings of the copy: the copy holds only the repository's files,
+        # and temporary files the code creates are not "inside the repository".
+        self.home = self._tmp / "home"
+        self.tmpdir = self._tmp / "tmp"
+        self.home.mkdir()
+        self.tmpdir.mkdir()
         self._runs = 0
 
     def __enter__(self):
@@ -222,13 +229,15 @@ class Sandbox:
 
     def environment(self) -> dict[str, str]:
         env = {k: v for k, v in os.environ.items() if k.upper() in ENV_ALLOW}
-        home, tmp = str(self.root / ".sandbox-home"), str(self.root / ".sandbox-tmp")
+        home, tmp = str(self.home), str(self.tmpdir)
         env.update({"HOME": home, "USERPROFILE": home, "TMPDIR": tmp, "TEMP": tmp, "TMP": tmp,
                     "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
                     "NOEMA_SANDBOX": self.backend.name, "NO_COLOR": "1",
                     "http_proxy": DEAD_PROXY, "https_proxy": DEAD_PROXY, "HTTP_PROXY": DEAD_PROXY,
                     "HTTPS_PROXY": DEAD_PROXY, "ALL_PROXY": DEAD_PROXY, "all_proxy": DEAD_PROXY,
-                    "no_proxy": "", "NO_PROXY": "", "PIP_NO_INDEX": "1"})
+                    # Loopback is not "the network": local test servers must stay reachable.
+                    "no_proxy": "localhost,127.0.0.1,::1", "NO_PROXY": "localhost,127.0.0.1,::1",
+                    "PIP_NO_INDEX": "1"})
         return env
 
     def run(self, command: list[str], workdir: str = ".", timeout: float = DEFAULT_TIMEOUT_S, network: bool = False,

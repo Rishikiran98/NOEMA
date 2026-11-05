@@ -29,11 +29,11 @@ untrusted code on a machine holding data you care about. Isolation is M3.2 (cont
 
 | | Behaviour |
 |---|---|
-| copy | the command runs in a temporary copy, made with the index's rules; ignored files, likely secrets (by name, e.g. `.env`, keys) and symlinks are **not copied**; the original repository is never written |
+| copy | the command runs in a temporary copy: files ignored by `.gitignore`, likely secrets (by name, e.g. `.env`, keys) and symlinks are **not copied**; `.noemaignore` is not applied (it only governs NOEMA's index, and tests may need those files); the original repository is never written |
 | command | an argument list only, never a shell string; `workdir` must be a directory inside the copy |
 | timeout | the whole process tree is killed (POSIX process group; Windows `taskkill /T`); `exit_code` is null and `timed_out` true |
 | output | the last 8,000 characters of each stream are kept (`output_truncated` set); a stream over 10 MiB kills the command |
-| environment | only `PATH` and a few locale/system variables pass through; credentials (API keys, tokens, cloud, NOEMA and `LLAMA_API_KEY` secrets) are dropped; HOME/TEMP point inside the sandbox; proxy variables point at a dead port (a hint, not a block); `PYTHONNOUSERSITE`, `PIP_NO_INDEX` |
+| environment | only `PATH` and a few locale/system variables pass through; credentials (API keys, tokens, cloud, NOEMA and `LLAMA_API_KEY` secrets) are dropped; HOME/TEMP are folders **beside** the copy (inside the sandbox, not inside the repository); proxy variables point at a dead port (a hint, not a block) while loopback (`localhost`, `127.0.0.1`, `::1`) bypasses it; `PYTHONNOUSERSITE`, `PIP_NO_INDEX` |
 | limits (POSIX) | address space 2 GiB, file size 256 MiB, CPU seconds = timeout + 1, no core dumps |
 | limits (Windows) | **NOT APPLIED**: reported as such in `limits` |
 | network | **NOT blocked**: `limits.network_blocked` is always false for `dev` |
