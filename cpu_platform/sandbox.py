@@ -134,6 +134,28 @@ class DevBackend:
             "core_dumps": "disabled" if have_resource else "NOT APPLIED",
         }
 
+    def prepare(self, sandbox: "Sandbox") -> None:
+        """Called once when the sandbox copy exists. Nothing to do for dev."""
+
+    def python(self) -> str:
+        return sys.executable
+
+    def run_warnings(self, network: bool) -> list[str]:
+        out = [DEV_WARNING]
+        if network:
+            out.append("network was requested; the dev backend does not restrict it anyway")
+        return out
+
+    def launch(self, sandbox: "Sandbox", command: list[str], cwd: Path, env: dict, timeout: float, run_id: str):
+        """(argv, cwd, env, popen kwargs) for this run."""
+        posix = os.name == "posix"
+        kwargs = {"start_new_session": True, "preexec_fn": self.preexec(timeout)} if posix else \
+            {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        return list(command), cwd, env, kwargs
+
+    def kill(self, proc: subprocess.Popen, run_id: str) -> None:
+        _kill_tree(proc)
+
     def preexec(self, timeout: float):
         if os.name != "posix":
             return None
@@ -186,7 +208,7 @@ def _snapshot(root: Path) -> dict[str, str]:
 class Sandbox:
     """A temporary copy of ``repo`` and a backend to run commands in it."""
 
-    def __init__(self, repo: str | Path, backend: DevBackend, *, keep: bool = False):
+    def __init__(self, repo: str | Path, backend, *, keep: bool = False):
         self.repo = Path(repo).resolve()
         if not self.repo.is_dir():
             raise SandboxError(f"not a directory: {repo}")
@@ -203,6 +225,16 @@ class Sandbox:
         self.home.mkdir()
         self.tmpdir.mkdir()
         self._runs = 0
+        try:
+            backend.prepare(self)
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def base(self) -> Path:
+        """The sandbox folder: the repository copy plus HOME and TEMP."""
+        return self._tmp
 
     def __enter__(self):
         return self
@@ -252,16 +284,14 @@ class Sandbox:
         cwd = self._workdir(workdir)
         self._runs += 1
         limits = self.backend.limits(timeout)
-        warnings = [DEV_WARNING] if not self.backend.security_boundary else []
-        if network:
-            warnings.append("network was requested; the dev backend does not restrict it anyway")
-        posix = os.name == "posix"
-        kwargs = {"start_new_session": True, "preexec_fn": self.backend.preexec(timeout)} if posix else \
-            {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        warnings = self.backend.run_warnings(network)
+        run_id = f"X{self._runs}"
+        argv, run_cwd, run_env, kwargs = self.backend.launch(self, list(command), cwd, self.environment(), timeout,
+                                                             run_id)
         started = time.perf_counter()
         flood = threading.Event()
         try:
-            proc = subprocess.Popen(command, cwd=cwd, env=self.environment(), stdin=subprocess.DEVNULL,
+            proc = subprocess.Popen(argv, cwd=run_cwd, env=run_env, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
         except OSError as exc:
             record = ExecutionRecord(id=f"X{self._runs}", command=list(command), backend=self.backend.name,
@@ -281,7 +311,7 @@ class Sandbox:
                 break
             time.sleep(0.02)
         if proc.poll() is None:
-            _kill_tree(proc)
+            self.backend.kill(proc, run_id)
         exit_code = None if (timed_out or flood.is_set()) else proc.returncode
         try:
             proc.wait(timeout=10)
@@ -318,13 +348,24 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+def make_backend(name: str, acknowledge_dev: bool = False, image: str | None = None):
+    """Backend by name, for command lines: 'dev' needs the acknowledgement; 'container' probes."""
+    if name == "container":
+        from .container import DEFAULT_IMAGE, ContainerBackend
+        return ContainerBackend(image=image or DEFAULT_IMAGE)
+    return DevBackend(acknowledge_not_isolated=acknowledge_dev)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a command in a sandbox copy of a repository (dev backend: "
                                                  "NOT a security boundary)")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("run")
     p.add_argument("path")
-    p.add_argument("--i-understand-dev-is-not-isolated", action="store_true", dest="ack", required=True)
+    p.add_argument("--backend", choices=("dev", "container"), default="dev")
+    p.add_argument("--image", help="container image (container backend; never pulled implicitly)")
+    p.add_argument("--i-understand-dev-is-not-isolated", action="store_true", dest="ack",
+                   help="required for --backend dev")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     p.add_argument("--workdir", default=".")
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -335,7 +376,7 @@ def main(argv: list[str] | None = None) -> int:
     if not command:
         parser.error("give the command after --, e.g. -- python -m unittest")
     try:
-        with Sandbox(args.path, DevBackend(acknowledge_not_isolated=args.ack)) as box:
+        with Sandbox(args.path, make_backend(args.backend, args.ack, args.image)) as box:
             result = box.run(command, args.workdir, args.timeout)
             changes = box.changes()
     except SandboxError as exc:

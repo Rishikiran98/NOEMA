@@ -16,6 +16,8 @@ with Sandbox("path/to/repo", DevBackend(acknowledge_not_isolated=True)) as box:
 py -m cpu_platform.sandbox run . --i-understand-dev-is-not-isolated -- py -m unittest tests.test_m13_contract
 ```
 
+Backends: `dev` (below) and `container` ([container.md](container.md), M3.2).
+
 ## The `dev` backend is NOT a security boundary
 
 It runs the command on this machine, as the current user. The command can read anything that
