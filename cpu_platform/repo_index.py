@@ -321,17 +321,19 @@ def default_db_path(root: Path) -> Path:
     return home / "index" / f"{root.resolve().name}-{digest}.sqlite"
 
 
-def iter_files(root: Path, *, extra_ignore_file: str = ".noemaignore"):
+def iter_files(root: Path, *, extra_ignore_file: str | None = ".noemaignore", extra_ignores: tuple[str, ...] = ()):
     """Yield (rel_posix_path, os.stat_result) for files to consider, plus
-    ("<skip>", rel, reason) tuples for things deliberately not followed."""
-    base = IgnoreMatcher(parse_lines(DEFAULT_IGNORES, "", "<default>"))
+    ("<skip>", rel, reason) tuples for things deliberately not followed. ``extra_ignore_file=None``
+    skips ``.noemaignore`` (which only governs NOEMA's index); ``extra_ignores`` adds patterns."""
+    base = IgnoreMatcher(parse_lines(DEFAULT_IGNORES + tuple(extra_ignores), "", "<default>"))
     base.add_file(root / ".git" / "info" / "exclude", "")
     stack = [("", root, base)]
     while stack:
         rel_dir, abs_dir, parent = stack.pop()
         matcher = parent.child()
         matcher.add_file(abs_dir / ".gitignore", rel_dir)
-        matcher.add_file(abs_dir / extra_ignore_file, rel_dir)
+        if extra_ignore_file:
+            matcher.add_file(abs_dir / extra_ignore_file, rel_dir)
         try:
             entries = sorted(os.scandir(abs_dir), key=lambda e: e.name)
         except OSError:

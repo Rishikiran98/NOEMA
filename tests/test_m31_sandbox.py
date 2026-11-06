@@ -175,9 +175,12 @@ class Environment(Workspace):
         env = json.loads(r.stdout_tail)
         for name in secrets:
             self.assertNotIn(name, env)
-        root = str(self.box.root)
+        # Inside the sandbox, but beside the repository copy, not in it (M3.3: a test that
+        # creates an index in TEMP must not be told it is "inside the repository").
+        base, root = str(self.box.root.parent), str(self.box.root)
         for name in ("HOME", "TMPDIR", "TEMP", "TMP", "USERPROFILE"):
-            self.assertTrue(env[name].startswith(root), name)
+            self.assertTrue(env[name].startswith(base), name)
+            self.assertFalse(env[name].startswith(root + os.sep), name)
         self.assertEqual(env["HTTPS_PROXY"], sb.DEAD_PROXY)
         self.assertEqual(env["NOEMA_SANDBOX"], "dev")
         self.assertIn("PATH", env)
