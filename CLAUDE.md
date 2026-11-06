@@ -85,6 +85,7 @@ numbers, line counts or test counts.
 | `cpu_platform/citation_check.py` | citation verifier: path safety, file/lines/quote checks against the working tree, never reads excluded files; relevance NOT CHECKED ([docs/citation-check.md](docs/citation-check.md)) |
 | `cpu_platform/injection.py`, `injection_eval.py` | prompt-injection hardening (neutralize control tokens and invisible characters, flag instruction-like text) and the canary attack harness on `data/injection` ([docs/injection.md](docs/injection.md)) |
 | `cpu_platform/sandbox.py` | sandbox interface; `dev` backend is NOT a security boundary (temp copy, timeouts, output caps, scrubbed env, POSIX rlimits) ([docs/sandbox.md](docs/sandbox.md)) |
+| `cpu_platform/container.py` | Docker sandbox backend: no network, read-only root, non-root, limits; claims `security_boundary` only after an in-container probe passes ([docs/container.md](docs/container.md)) |
 | `cpu_platform/testrun.py` | runs unittest/pytest in the sandbox, per-test outcomes and durations; results can be forged by malicious code (needs M3.2) ([docs/testrun.md](docs/testrun.md)) |
 | `cpu_platform/launch.py`, `hardware.py` | hardware-aware CPU-only llama.cpp launcher |
 | `cpu_platform/jobs.py` | SQLite job queue |

@@ -30,7 +30,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 from .contract import ExecutionRecord
-from .sandbox import DevBackend, Sandbox, SandboxError
+from .sandbox import DevBackend, Sandbox, SandboxError, make_backend
 
 OUTCOMES = ("passed", "failed", "error", "skipped", "xfail", "xpass")
 MAX_MESSAGE = 2000
@@ -155,8 +155,9 @@ def _pytest_configured(root: Path) -> str | None:
     return None
 
 
-def detect(box: Sandbox, python: str = sys.executable) -> TestPlan:
+def detect(box: Sandbox, python: str | None = None) -> TestPlan:
     """Pick the framework from the repository's own configuration (in the sandbox copy)."""
+    python = python or box.backend.python()
     root = box.root
     marker = _pytest_configured(root)
     start = "tests" if (root / "tests").is_dir() else "."
@@ -285,12 +286,13 @@ def _run_pytest(box: Sandbox, plan: TestPlan, select: list[str], timeout: float,
 
 
 def run_tests(box: Sandbox, *, select: list[str] | None = None, framework: str | None = None,
-              timeout: float = 600, python: str = sys.executable) -> TestRun:
+              timeout: float = 600, python: str | None = None) -> TestRun:
     """Detect (unless ``framework`` is given) and run the suite, or only ``select``."""
     select = [s for s in (select or []) if s]
     for s in select:
         if s.startswith("-") or "\x00" in s:
             raise SandboxError(f"test selector must be a test id, not an option: {s!r}")
+    python = python or box.backend.python()
     plan = TestPlan(framework, "requested", "tests" if (box.root / "tests").is_dir() else ".") if framework \
         else detect(box, python)
     if plan.framework not in ("unittest", "pytest"):
@@ -309,14 +311,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a repository's tests in a sandbox copy (dev backend: "
                                                  "NOT a security boundary)")
     parser.add_argument("path")
-    parser.add_argument("--i-understand-dev-is-not-isolated", action="store_true", dest="ack", required=True)
+    parser.add_argument("--backend", choices=("dev", "container"), default="dev")
+    parser.add_argument("--image", help="container image (container backend; never pulled implicitly)")
+    parser.add_argument("--i-understand-dev-is-not-isolated", action="store_true", dest="ack",
+                        help="required for --backend dev")
     parser.add_argument("--select", nargs="*", default=[], help="test ids (unittest dotted ids or pytest node ids)")
     parser.add_argument("--framework", choices=("unittest", "pytest"))
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--details", action="store_true", help="list every test, not only non-passing ones")
     args = parser.parse_args(argv)
     try:
-        with Sandbox(args.path, DevBackend(acknowledge_not_isolated=args.ack)) as box:
+        with Sandbox(args.path, make_backend(args.backend, args.ack, args.image)) as box:
             run = run_tests(box, select=args.select, framework=args.framework, timeout=args.timeout)
     except SandboxError as exc:
         parser.error(str(exc))
