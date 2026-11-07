@@ -260,10 +260,10 @@ class FixSearch:
             try:
                 completion = self.model.chat(SYSTEM_PROMPT, prompt, max_tokens=request.budget.max_output_tokens,
                                              temperature=cand.temperature, seed=cand.seed, thinking=request.thinking)
-            except ModelError as exc:
-                return self._model_error(upstream_error(exc), request_id, executions, evidence, checked, results,
-                                         not_run, cost, started)
-            except (UpstreamUnavailable, UpstreamFailed) as exc:
+            except (ModelError, UpstreamUnavailable, UpstreamFailed) as exc:
+                exc = upstream_error(exc) if isinstance(exc, ModelError) else exc
+                cand.status = "error"
+                cand.problems = [f"model call failed: {getattr(exc, 'code', 'error')}: {str(exc)[:200]}"]
                 return self._model_error(exc, request_id, executions, evidence, checked, results, not_run, cost,
                                          started)
             cost["calls"] += 1
@@ -401,6 +401,14 @@ def main(argv: list[str] | None = None) -> int:
         print(result.to_json())
     else:
         print(f"status: {result.status}")
+        if result.error:
+            print(f"error: {result.error.code}: {result.error.message}"
+                  + (" (retryable)" if result.error.retryable else ""))
+            if result.error.code == "local_model_unavailable":
+                print(f"hint: is the model server running on {args.model_url}? "
+                      "Start it with: py -m cpu_platform.launch --model qwen3-coder-30b-a3b --port 8080")
+            elif result.error.code == "local_model_mismatch":
+                print("hint: the loaded model or its context size differs from --expect-model (see the message)")
         for cand in search.candidates_tried:
             print(f"  candidate {cand.index}: {cand.status} ({cand.changed_lines} changed lines)"
                   + (f" {cand.problems[:2]}" if cand.problems else ""))

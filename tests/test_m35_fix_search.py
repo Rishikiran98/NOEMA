@@ -213,6 +213,24 @@ class Edges(Repo):
         self.assertEqual((result.status, result.error.code, result.error.retryable), ("error", "local_model_unavailable", True))
         self.assertTrue(result.executions)                                  # the baseline run is still recorded
 
+    def test_cli_explains_a_model_error(self):
+        """Regression (2026-11-07, laptop): the text output said only "status: error" with
+        candidate 1 "pending", hiding that the model server could not be reached."""
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = fsx.main([str(self.repo), "-n", "2", "--backend", "dev", "--i-understand-dev-is-not-isolated",
+                             "--model-url", f"http://127.0.0.1:{port}"])
+        text = out.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("error: local_model_unavailable", text)
+        self.assertIn("hint: is the model server running", text)
+        self.assertIn("candidate 1: error", text)
+        self.assertNotIn("pending", text)
+
     def test_request_must_be_repo_fix_with_execution(self):
         search = fsx.FixSearch(Scripted(GOOD), dev)
         with self.assertRaises(ValueError):
