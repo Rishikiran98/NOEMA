@@ -2,3 +2,5 @@
 data/retrieval/
 # Prompt-injection fixtures (M2.5): adversarial on purpose; never index them as NOEMA code.
 data/injection/
+# Fix-search fixtures (M3.5): deliberately buggy repositories, not NOEMA code.
+data/fix_fixtures/
