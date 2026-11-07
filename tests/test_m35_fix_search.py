@@ -138,7 +138,9 @@ class Search(Repo):
         search, result = self.search(Scripted(BIGGER_GOOD, GOOD, BIGGER_GOOD), stop_early=False, candidates=3)
         self.assertEqual(self.statuses(search), ["passed", "passed", "passed"])
         self.assertEqual([c.changed_lines for c in search.candidates_tried], [3, 2, 3])
-        self.assertTrue(result.answer.rstrip().endswith("+    return a + b"))
+        # The answer is the applied change regenerated with 3 context lines (not the model's text).
+        self.assertIn("-    return a - b\n+    return a + b\n", result.answer)
+        self.assertNotIn("total", result.answer)
         self.assertIn("candidate 2's patch fixes", result.unverified_claims[0].claim)
 
     def test_every_failure_mode(self):
@@ -298,6 +300,22 @@ SLOPPY_FIXES = {
 }
 
 
+class AppliedDiff(unittest.TestCase):
+    def test_unified_diff_round_trips_including_missing_final_newline(self):
+        from cpu_platform.patch import unified_diff
+        cases = [("a\nb\nc\n", "a\nB\nc\n"), ("a\nb", "a\nb\nc"), ("x\n", "x"), (None, "new\n"), ("gone\n", None)]
+        for old, new in cases:
+            with self.subTest(old=old, new=new), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                if old is not None:
+                    (root / "f.txt").write_text(old, encoding="utf-8", newline="")
+                with Sandbox(root, dev()) as box:
+                    result = apply(box, parse(unified_diff("f.txt", old, new)))
+                    self.assertTrue(result.applied, result.problems)
+                    target = box.root / "f.txt"
+                    self.assertEqual(target.read_bytes().decode() if target.exists() else None, new)
+
+
 class SloppyDiffs(unittest.TestCase):
     def test_fixtures_fixed_by_imperfect_but_unambiguous_diffs(self):
         for name, diff in SLOPPY_FIXES.items():
@@ -310,6 +328,16 @@ class SloppyDiffs(unittest.TestCase):
                 applies = [c for c in result.checked_claims if "applies to the repository" in c.claim]
                 self.assertEqual(applies[0].result, "verified")
                 self.assertIn("read leniently", applies[0].scope)
+                # The reported patch is the change that was tested, as a clean diff: it applies
+                # strictly (no lenient flags) to the original and gives the same file.
+                strict = parse(result.answer)
+                self.assertEqual([p.code for p in strict.problems], [])
+                with Sandbox(FIXTURES / name, dev()) as box:
+                    again = apply(box, strict)
+                    self.assertTrue(again.applied)
+                    self.assertEqual([p.code for p in again.problems], [])
+                    self.assertEqual(run_tests(box).status, "passed")
+                self.assertEqual(search.candidates_tried[0].changed_lines, 2)
 
     def test_a_diff_that_does_not_fit_is_refuted_as_applying(self):
         stale = fenced("--- a/pricing/tax.py\n+++ b/pricing/tax.py\n@@ -1 +1 @@\n-VAT_RATE = 0.05\n+VAT_RATE = 0.20\n")

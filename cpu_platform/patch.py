@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass, field
+import difflib
 import fnmatch
 import json
 from pathlib import Path
@@ -493,6 +494,29 @@ def apply(box, patch: Patch, policy: PatchPolicy = PatchPolicy()) -> ApplyResult
         problems.append(Problem("flag", "other_changes", None,
                                 f"the sandbox copy also differs in files the patch did not name: {sorted(unexpected)[:10]}"))
     return ApplyResult(True, sorted(planned), offsets, problems, changes)
+
+
+def unified_diff(path: str, old: str | None, new: str | None, context: int = 3) -> str:
+    """A standard unified diff of one file (None = the file does not exist), with exact header
+    counts and "\\ No newline at end of file" markers, so ``git apply`` accepts it."""
+    old_lines = (old or "").splitlines(keepends=True)
+    new_lines = (new or "").splitlines(keepends=True)
+    out = []
+    for line in difflib.unified_diff(old_lines, new_lines, "/dev/null" if old is None else f"a/{path}",
+                                     "/dev/null" if new is None else f"b/{path}", n=context):
+        out.append(line)
+        if not line.endswith("\n"):
+            out.append("\n\\ No newline at end of file\n")
+    return "".join(out)
+
+
+def applied_diff(original_root: str | Path, box, files: list[str]) -> str:
+    """What a successful ``apply`` actually changed, as a clean diff: the original repository's
+    files against the sandbox copy's. It differs from the model's text when the diff was read
+    leniently (recounted, re-placed, retyped context), and it is the patch that was tested."""
+    def read(path: Path) -> str | None:
+        return path.read_bytes().decode("utf-8") if path.is_file() else None
+    return "".join(unified_diff(f, read(Path(original_root) / f), read(Path(box.root) / f)) for f in files)
 
 
 # --------------------------------------------------------------------------- CLI

@@ -41,7 +41,7 @@ from .injection import neutralize
 from .contract import (CheckedClaim, Cost, EngineRequest, EngineResult, ErrorInfo, Evidence, ExecutionRecord,
                        ModelInfo, NotRun, UnverifiedClaim, not_measured, validate_result)
 from .engine import UpstreamFailed, UpstreamUnavailable, upstream_error
-from .patch import PatchPolicy, apply, is_test_path, parse
+from .patch import PatchPolicy, applied_diff, apply, is_test_path, parse
 from .repo_index import RepoIndex
 from .repo_qa import format_excerpt, select_context
 from .retrieval import Hit, Retriever
@@ -335,6 +335,11 @@ class FixSearch:
             if not applied.applied:
                 cand.status = "rejected" if not ok_policy else "does_not_apply"
                 return
+            # Report the change that was actually applied and tested, not the model's text (which
+            # may have wrong counts or retyped context when it was read leniently).
+            cand.diff = applied_diff(repo, box, applied.files)
+            cand.changed_lines = sum(1 for l in cand.diff.splitlines()
+                                     if l[:1] in "+-" and not l.startswith(("+++ ", "--- ")))
             if targets is None:          # cannot target: the full run below is the only check
                 cand.full = run_tests(box, timeout=self.test_timeout)
                 fid = record(cand.full, f"C{cand.index}F")
