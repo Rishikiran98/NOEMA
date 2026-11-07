@@ -277,6 +277,7 @@ class LauncherKeyStatus(unittest.TestCase):
                 pass
 
             def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))   # see fake_llama.do_POST
                 self.send_response(code)
                 self.send_header("Content-Length", "2")
                 self.end_headers()

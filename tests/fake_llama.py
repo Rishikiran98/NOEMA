@@ -110,9 +110,12 @@ class FakeLlama:
                 self._json(404, {})
 
             def do_POST(self):
+                # Read the body before any reply, 401 included: Windows resets a connection
+                # closed with unread data, and the client would lose the response.
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 if not self._authorized():
                     return
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                body = json.loads(raw)
                 fake.requests.append(body)
                 time.sleep(fake.delay_s)
                 self._json(200, fake.complete(body))
