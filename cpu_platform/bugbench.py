@@ -443,7 +443,8 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
                    "model_calls": result.cost.model_calls, "prompt_tokens": result.cost.prompt_tokens,
                    "completion_tokens": result.cost.completion_tokens,
                    "model_seconds": result.cost.model_wall_seconds, "total_seconds": round(time.perf_counter() - started, 1),
-                   "error": result.error.code if result.error else None, "answer": result.answer}
+                   "error": result.error.code if result.error else None,
+                   "error_message": result.error.message[:500] if result.error else None, "answer": result.answer}
             rows.append(row)
             with out_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
@@ -451,10 +452,12 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
                 from .audit import write
                 write(request, result, audit_dir)
             log(f"[{n}/{len(mutants)}] {m['id']} {m['operator']}: {row['status']}"
-                + (" (exact restore)" if exact else "") + f", {row['model_calls']} call(s), {row['total_seconds']} s")
+                + (" (exact restore)" if exact else "") + f", {row['model_calls']} call(s), {row['total_seconds']} s"
+                + (f"\n    error {row['error']}: {row['error_message']}" if row["error"] else ""))
             shutil.rmtree(work, ignore_errors=True)
             if result.status == "error" and result.error and result.error.code.startswith("local_model"):
-                log("stopping: the model server is not usable")
+                log("stopping: the model server is not usable (is it running and loaded? check "
+                    "Invoke-WebRequest http://127.0.0.1:8080/health; a 503 'Loading model' means wait)")
                 break
     summary = summarize(rows)
     summary.update(split=split, manifest_sha256=manifest["sha256"], candidates=candidates, results=str(out_path))

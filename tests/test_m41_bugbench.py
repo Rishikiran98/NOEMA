@@ -204,6 +204,27 @@ class Building(unittest.TestCase):
         rows = [json.loads(l) for l in (self.root / "bad.jsonl").read_text().splitlines()]
         self.assertEqual({r["status"] for r in rows}, {"incomplete"})
 
+    def test_model_error_is_shown_and_stops_the_run(self):
+        from cpu_first.core import ModelTransportError
+        bench = self.root / "bench"
+        self.build(bench)
+
+        class Down:
+            model = "down"
+
+            def chat(self, *args, **kwargs):
+                raise ModelTransportError("connection refused")
+
+        lines = []
+        summary = bb.run("dev", model=Down(), backend_factory=dev, candidates=2, out_path=self.root / "d.jsonl",
+                         out_dir=bench, root=self.root, log=lines.append)
+        self.assertEqual((summary["errors"], summary["overall"]["attempted"]), (1, 1))
+        self.assertIn("error local_model_unavailable: ", "\n".join(lines))
+        self.assertIn("connection refused", "\n".join(lines))
+        self.assertTrue(lines[-1].startswith("stopping: the model server is not usable"))
+        row = json.loads((self.root / "d.jsonl").read_text().splitlines()[0])
+        self.assertIn("connection refused", row["error_message"])
+
     def test_eval_needs_approval_and_is_logged(self):
         bench = self.root / "bench"
         self.build(bench)
