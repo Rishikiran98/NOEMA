@@ -534,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--image")
             p.add_argument("--i-understand-dev-is-not-isolated", action="store_true", dest="ack")
             p.add_argument("--select", nargs="*", default=[])
+            p.add_argument("--no-tests", action="store_true", help="only apply the patch in the sandbox copy")
     args = parser.parse_args(argv)
     patch = parse(Path(args.patch).read_text(encoding="utf-8", errors="replace"))
     policy = PatchPolicy(allow_test_changes=args.allow_test_changes)
@@ -548,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
             applied = apply(box, patch, policy)
             out = {"applied": applied.applied, "files": applied.files, "offsets": applied.offsets,
                    "problems": [asdict(p) for p in applied.problems]}
-            if applied.applied:
+            if applied.applied and not args.no_tests:
                 run = run_tests(box, select=args.select)
                 out["tests"] = {"status": run.status, "counts": run.counts, "problems": run.problems,
                                 "failing": [t.id for t in run.tests if t.outcome in ("failed", "error")],
@@ -557,6 +558,8 @@ def main(argv: list[str] | None = None) -> int:
     except SandboxError as exc:
         parser.error(str(exc))
     print(json.dumps(out, indent=2))
+    if args.no_tests:
+        return 0 if out["applied"] else 1
     return 0 if out["applied"] and out.get("tests", {}).get("status") == "passed" else 1
 
 

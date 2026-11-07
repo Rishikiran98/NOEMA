@@ -37,6 +37,7 @@ from secrets import token_hex
 
 from cpu_first.core import ModelError
 from . import __version__
+from .audit import repository_evidence, test_summary
 from .injection import neutralize
 from .contract import (CheckedClaim, Cost, EngineRequest, EngineResult, ErrorInfo, Evidence, ExecutionRecord,
                        ModelInfo, NotRun, UnverifiedClaim, not_measured, validate_result)
@@ -224,23 +225,29 @@ class FixSearch:
             not_run.append(NotRun(f"candidates {budget_calls + 1}-{self.candidates}",
                                   f"request budget allows {request.budget.max_model_calls} model call(s)"))
 
-        def record(run: TestRun, prefix: str) -> str:
+        def record(run: TestRun, prefix: str, select=None, patch_id=None) -> str:
             rec = replace(run.record, id=f"{prefix}-{run.record.id}"[:64])
             executions.append(rec)
+            # Per-test outcomes, the selection and the patch, so an audit report can say how
+            # to repeat the run (M3.6). Passing tests are counted, not listed, to fit.
+            evidence.append(Evidence(id=f"{rec.id[:60]}-T", kind="command_output", source=rec.id,
+                                     excerpt=test_summary(run, select, patch_id),
+                                     retrieved_by=f"testrun.{run.framework}"))
             return rec.id
 
+        evidence.append(repository_evidence(repo))
         with RepoIndex(repo, None) as index:
             index.update()
             retriever = Retriever(index)
         with Sandbox(repo, self.backend_factory()) as box:
             baseline = run_tests(box, select=select, timeout=self.test_timeout)
-            base_id = record(baseline, "B")
+            base_id = record(baseline, "B", select)
             shown, failing_ids = failure_context(baseline, retriever, box, self.max_context_chars)
             backend_name, boundary = box.backend.name, box.backend.security_boundary
         failing = [t for t in baseline.tests if t.outcome in ("failed", "error")]
         checked.append(CheckedClaim(
             f"before any patch, {len(failing)} selected test(s) fail", "verified", f"testrun.{baseline.framework}",
-            f"observed in the {backend_name} sandbox; does not show why they fail", [base_id]))
+            f"observed in the {backend_name} sandbox; does not show why they fail", [base_id, f"{base_id[:60]}-T"]))
         if baseline.status in ("error", "timed_out") and not failing:
             return self._finish(request_id, "error", None, executions, evidence, checked, [], not_run, cost, started,
                                 ErrorInfo("baseline_failed", "; ".join(baseline.problems)[:500] or baseline.status, False))
@@ -323,7 +330,8 @@ class FixSearch:
                                         "paths, protected files (tests, CI, secrets, start-up hooks), size and "
                                         "content checks only; says nothing about whether the change is right",
                                         [f"P{cand.index}"],
-                                        [p for p in cand.problems if p.startswith("reject")][:5]))
+                                        [p for p in cand.problems if p.startswith("reject")
+                                         and ":does_not_apply:" not in p][:5]))
             if ok_policy:
                 lenient = [p.message for p in applied.problems if p.code in LENIENT_CODES]
                 checked.append(CheckedClaim(f"candidate {cand.index}'s patch applies to the repository",
@@ -340,33 +348,37 @@ class FixSearch:
             cand.diff = applied_diff(repo, box, applied.files)
             cand.changed_lines = sum(1 for l in cand.diff.splitlines()
                                      if l[:1] in "+-" and not l.startswith(("+++ ", "--- ")))
+            patch_id = f"D{cand.index}"
+            evidence.append(Evidence(id=patch_id, kind="model_output", source=f"candidate {cand.index}, as applied",
+                                     excerpt=cand.diff[:4000], sha256=hashlib.sha256(cand.diff.encode("utf-8")).hexdigest(),
+                                     retrieved_by="patch.applied_diff"))
             if targets is None:          # cannot target: the full run below is the only check
                 cand.full = run_tests(box, timeout=self.test_timeout)
-                fid = record(cand.full, f"C{cand.index}F")
+                fid = record(cand.full, f"C{cand.index}F", None, patch_id)
                 ok = cand.full.status == "passed"
                 checked.append(CheckedClaim(f"with candidate {cand.index} applied, the full test suite passes",
                                             "verified" if ok else "refuted", f"testrun.{cand.full.framework}",
                                             "every collected test passed in the sandbox copy; does not show the code "
-                                            "is correct or that the tests cover the bug", [fid]))
+                                            "is correct or that the tests cover the bug", [fid, f"{fid[:60]}-T", patch_id]))
                 cand.status = "passed" if ok else "full_failed"
                 return
             cand.targeted = run_tests(box, select=targets, timeout=self.test_timeout)
-            tid = record(cand.targeted, f"C{cand.index}T")
+            tid = record(cand.targeted, f"C{cand.index}T", targets, patch_id)
             ok = cand.targeted.status == "passed"
             checked.append(CheckedClaim(f"with candidate {cand.index} applied, the previously failing tests pass",
                                         "verified" if ok else "refuted", f"testrun.{cand.targeted.framework}",
                                         "these tests passed in the sandbox copy; says nothing about other behaviour",
-                                        [tid]))
+                                        [tid, f"{tid[:60]}-T", patch_id]))
             if not ok:
                 cand.status = "targeted_failed"
                 return
             cand.full = run_tests(box, timeout=self.test_timeout)
-            fid = record(cand.full, f"C{cand.index}F")
+            fid = record(cand.full, f"C{cand.index}F", None, patch_id)
             ok = cand.full.status == "passed"
             checked.append(CheckedClaim(f"with candidate {cand.index} applied, the full test suite passes",
                                         "verified" if ok else "refuted", f"testrun.{cand.full.framework}",
                                         "every collected test passed in the sandbox copy; does not show the code is "
-                                        "correct or that the tests cover the bug", [fid]))
+                                        "correct or that the tests cover the bug", [fid, f"{fid[:60]}-T", patch_id]))
             cand.status = "passed" if ok else "full_failed"
 
     def _model_error(self, exc, request_id, executions, evidence, checked, results, not_run, cost, started):
@@ -405,6 +417,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-output-tokens", type=int, default=1024)
     parser.add_argument("--max-wall-seconds", type=float, default=3600)
     parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument("--audit", metavar="DIR", help="also write a Markdown and JSON audit report here (M3.6)")
     parser.add_argument("--show-answers", action="store_true",
                         help="print each non-passing candidate's raw model answer (text format)")
     args = parser.parse_args(argv)
@@ -448,6 +461,10 @@ def main(argv: list[str] | None = None) -> int:
         c = result.cost
         print(f"cost: {c.model_calls} model call(s), {c.prompt_tokens}+{c.completion_tokens} tokens, "
               f"{c.model_wall_seconds:.0f} s model, {c.total_wall_seconds:.0f} s total")
+    if args.audit:
+        from .audit import write
+        for path in write(request, result, args.audit):
+            print(f"audit report: {path}", file=sys.stderr if args.format == "json" else sys.stdout)
     return 0 if result.status == "ok" else 1
 
 

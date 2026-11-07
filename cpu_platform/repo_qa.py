@@ -166,9 +166,10 @@ def select_context(hits: list[Hit], max_chars: int) -> tuple[dict[str, Hit], int
 
 class RepoQA:
     def __init__(self, model, *, top_k: int = DEFAULT_TOP_K, max_context_chars: int = DEFAULT_CONTEXT_CHARS,
-                 check_citations: bool = True):
+                 check_citations: bool = True, record_repository_state: bool = True):
         self.model = model
         self.check_citations = check_citations
+        self.record_repository_state = record_repository_state
         self.top_k = top_k
         self.max_context_chars = max_context_chars
 
@@ -183,6 +184,11 @@ class RepoQA:
                              end_line=hit.end_line, sha256=hashlib.sha256(hit.text.encode("utf-8")).hexdigest(),
                              excerpt=hit.text[:4000], retrieved_by="bm25:" + ",".join(hit.matched_terms)[:180])
                     for eid, hit in shown.items()]
+        root = getattr(getattr(retriever, "index", None), "root", None)
+        if root is not None and self.record_repository_state:
+            # M3.6: the repository's state, so an audit report can tie citation checks to it.
+            from .audit import repository_evidence
+            evidence.append(repository_evidence(root))
         not_run = [NotRun("answer correctness", "no checker verifies what the answer says"),
                    NotRun("citation relevance", "whether a cited span supports the statement is NOT CHECKED")]
         if dropped:
@@ -350,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-context-chars", type=int, default=DEFAULT_CONTEXT_CHARS)
     parser.add_argument("--max-output-tokens", type=int, default=1024)
     parser.add_argument("--format", choices=("json", "text"), default="text")
+    parser.add_argument("--audit", metavar="DIR", help="also write a Markdown and JSON audit report here (M3.6)")
     args = parser.parse_args(argv)
     from .contract import ContractError, request_from_dict
     from .engine import LazyLocalModel
@@ -368,6 +375,10 @@ def main(argv: list[str] | None = None) -> int:
     except (ContractError, ValueError) as exc:
         parser.error(str(exc))
     print(result.to_json() if args.format == "json" else render_text(result))
+    if args.audit:
+        from .audit import write
+        for path in write(request, result, args.audit):
+            print(f"audit report: {path}", file=sys.stderr)
     return 0 if result.status != "error" else 1
 
 

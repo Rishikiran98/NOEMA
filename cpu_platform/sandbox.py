@@ -174,19 +174,25 @@ class DevBackend:
         return apply
 
 
-def _copy_repository(src: Path, dst: Path) -> dict[str, str]:
-    """Copy files the index would consider (ignored, secret-named, symlinked and oversized
-    files are left out). Returns {relative path: sha256} of what was copied."""
-    copied = {}
+def copy_selection(src: Path):
+    """Repository-relative paths a sandbox copies (ignored, secret-named, symlinked and
+    oversized files are left out). Also defines the repository fingerprint in audit reports."""
     # .gitignore rules apply; .noemaignore does not (it only keeps files out of NOEMA's
     # index, and a repository's tests may need them). HOME/TEMP live beside the copy, never
     # inside it, so a sandbox started inside a sandbox cannot copy itself.
-    for item in iter_files(src, extra_ignore_file=None):
+    for item in iter_files(Path(src), extra_ignore_file=None):
         if item[0] == "<skip>":
             continue
         rel, info = item
         if secret_name_reason(rel.rsplit("/", 1)[-1]) or info.st_size > DEFAULT_MAX_FILE_BYTES * 16:
             continue
+        yield rel
+
+
+def _copy_repository(src: Path, dst: Path) -> dict[str, str]:
+    """Copy the files ``copy_selection`` names. Returns {relative path: sha256} of what was copied."""
+    copied = {}
+    for rel in copy_selection(src):
         target = dst / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src / rel, target)
