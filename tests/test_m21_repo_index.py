@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from cpu_platform import repo_index as ri
@@ -362,8 +363,8 @@ class Incremental(Workspace):
         self.assertIn("return 100", texts)
         self.assertNotIn("return 1\n", texts + "\n")                     # old chunk replaced
         self.assertNotIn("return 3", texts)                              # deleted file's chunks gone
-        self.assertEqual(sqlite3.connect(self.db).execute(
-            "SELECT COUNT(*) FROM symbols WHERE path='c.py'").fetchone()[0], 0)
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:   # closed: Windows locks open files
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM symbols WHERE path='c.py'").fetchone()[0], 0)
 
     def test_file_that_gains_a_secret_leaves_the_searchable_index(self):
         f = write(self.repo, "settings.py", "DEBUG = True\n")
@@ -395,8 +396,14 @@ class Storage(Workspace):
         self.index().update()
         other = Path(self.tmp.name) / "other"
         other.mkdir()
-        with self.assertRaises(ValueError):
-            ri.RepoIndex(other, self.db)
+        opened = []
+        real_connect = ri.connect
+        with mock.patch.object(ri, "connect", lambda db: opened.append(real_connect(db)) or opened[-1]):
+            with self.assertRaises(ValueError):
+                ri.RepoIndex(other, self.db)
+        # The refused index must not keep its database open (Windows cannot delete it then).
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")
 
     def test_schema_version_is_checked(self):
         idx = self.index()

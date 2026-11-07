@@ -68,7 +68,9 @@ Getting there exposed three bugs in the M3.1 sandbox, now fixed:
 3. HOME/TEMP lived **inside** the copy. A sandbox started inside a sandbox could copy itself, and
    an index created in TEMP was refused as "inside the repository". They now live beside the copy.
 
-Windows: NOT RUN (`py -m unittest tests.test_m33_testrun -v`). Pytest projects are tested with
+Windows (user's laptop, 2026-11-07, `78495c9`): all M3.3 tests pass, including the nested
+full-suite run. NOEMA's suite through the **container** backend: 535 passed, 0 failed, 11 skipped
+(tools absent from `python:3.12-slim`), 115.6 s. Pytest projects are tested with
 pytest 9.2 installed for the tests only.
 
 ## Not done in M3.3

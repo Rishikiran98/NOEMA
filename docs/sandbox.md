@@ -52,7 +52,9 @@ Linux (cloud container): all 25 M3.1 tests pass, including:
 * a 2 GiB allocation refused under a 512 MiB limit;
 * NOEMA's own contract tests passing inside a copy while the original's hash stays unchanged.
 
-**Windows: NOT RUN.** On the laptop:
+**Windows (user's laptop, 2026-11-07):** every M3.1 test passed at `f2f2c32`, and the whole suite
+passed at `78495c9` (546 tests, OK, 24 skipped). The POSIX-only tests (resource limits,
+process-group kill) skip there; the `taskkill` path runs. To repeat:
 
 ```powershell
 py -m unittest tests.test_m31_sandbox -v

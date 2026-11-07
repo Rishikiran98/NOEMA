@@ -29,7 +29,12 @@ from .jobs import JobStore, JobWorkers, JobFault
 from . import __version__
 
 MAX_BODY_BYTES = 16 * 1024
-V2_MAX_BODY_BYTES = 64 * 1024   # EngineRequest questions may be up to 20,000 characters
+V2_MAX_BODY_BYTES = 64 * 1024
+# An early error (401/403/413...) must still read the request body before replying: on Windows,
+# closing a socket with unread data resets the connection and the client loses the response
+# (seen 2026-11-07 as WinError 10053). Bodies beyond this are not drained; the socket is closed.
+DRAIN_LIMIT_BYTES = 1024 * 1024
+DRAIN_TIMEOUT_S = 5   # EngineRequest questions may be up to 20,000 characters
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 log = logging.getLogger("noema.server")
 
@@ -135,14 +140,15 @@ class Handler(BaseHTTPRequestHandler):
         """Run a handler so that every request ends in a JSON response or a closed socket
         the client caused; never a silently dropped connection."""
         self._response_started = False
+        self._body_consumed = False
         problem = self._origin_problem()
         if problem:
             self._send(403, {"error": problem})
             return
         try:
             handler()
-        except (BrokenPipeError, ConnectionResetError):
-            self.close_connection = True  # client went away; nothing to answer
+        except ConnectionError:   # broken pipe, reset, or (Windows) aborted: client went away
+            self.close_connection = True
         except Exception:
             request_id = token_hex(8)
             # Traceback stays local; request bodies, headers and query strings are not logged.
@@ -170,7 +176,33 @@ class Handler(BaseHTTPRequestHandler):
 
     do_PUT = do_PATCH = do_OPTIONS = _method_not_allowed
 
+    def _drain(self) -> None:
+        """Read and discard an unread request body (bounded), so the reply is not lost."""
+        if getattr(self, "_body_consumed", True):
+            return
+        self._body_consumed = True
+        n_str = self.headers.get("Content-Length") or ""
+        remaining = min(int(n_str), DRAIN_LIMIT_BYTES) if n_str.isdigit() else 0
+        if not remaining:
+            return
+        previous = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(DRAIN_TIMEOUT_S)
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                self.connection.settimeout(previous)
+            except OSError:
+                pass
+
     def _send(self, code: int, data: dict):
+        self._drain()
         blob = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -210,8 +242,10 @@ class Handler(BaseHTTPRequestHandler):
             raise JobFault("body_too_large", 413)
         if n <= 0:
             raise JobFault("empty_body", 400)
+        raw = self.rfile.read(n)
+        self._body_consumed = True
         try:
-            body = json.loads(self.rfile.read(n))
+            body = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise JobFault("invalid_json", 400) from None
         if not isinstance(body, dict):
