@@ -92,8 +92,20 @@ skipped in the container image) is reported under `not_caught_here` and left out
 
 ## Measured
 
-See the progress log in [ROADMAP.md](ROADMAP.md) for the build numbers. Offline tests (stand-ins,
-not models):
+**The frozen benchmark (built 2026-11-07, cloud container, dev backend, seed 20261108):**
+277 mutants, `mutants.jsonl` SHA-256 `8d4f0331…afe52`. dev has 139 mutants and eval 138.
+
+| Base | Kept / tested | Survived (dropped) | Timed out (dropped) | flip | off-by-one | swap | constant | dropped cond. | Build time |
+|---|---|---|---|---|---|---|---|---|---|
+| NOEMA at `8e833cf` | 117 / 193 | 76 | 0 | 36 | 20 | 23 | 21 | 17 | 642 s |
+| more-itertools 10.5.0 | 160 / 179 | 15 | 4 | 48 | 35 | 24 | 18 | 35 | 583 s |
+
+NOEMA's candidates ran out before the target of 160. Only functions whose name appears in 1 to
+3 test modules qualify, and 39% of NOEMA's tested mutants survived its tests, against 8% for
+more-itertools. That survival rate is itself a finding: NOEMA's tests miss many small changes
+to its own code.
+
+Offline tests (stand-ins, not models):
 - every operator, and the edits it must not make;
 - building on a small repository: only caught mutants of tested functions are kept, the build
   is deterministic and frozen, and a tampered file is refused;
