@@ -439,6 +439,9 @@ class RepoIndex:
             self.conn.execute("INSERT INTO meta VALUES ('root', ?)", (str(self.root),))
             self.conn.commit()
         elif stored[0] != str(self.root):
+            # Close before refusing: an open handle keeps the file locked on Windows (seen
+            # 2026-11-07: the index could not be deleted afterwards, WinError 32).
+            self.conn.close()
             raise ValueError(f"{self.db_path} indexes {stored[0]}, not {self.root}")
 
     def close(self) -> None:

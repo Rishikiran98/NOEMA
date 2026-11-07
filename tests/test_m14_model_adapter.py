@@ -45,7 +45,7 @@ class ScriptedServer:
                 self.end_headers()
                 try:
                     self.wfile.write(body)
-                except (BrokenPipeError, ConnectionResetError):
+                except ConnectionError:   # incl. Windows ConnectionAbortedError
                     pass  # the client timed out first (the timeout test)
 
             def do_GET(self):

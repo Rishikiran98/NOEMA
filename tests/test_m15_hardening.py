@@ -123,6 +123,40 @@ class HostOriginGuard(ServerCase):
             server.shutdown()
             server.server_close()
 
+    def test_early_rejection_reads_the_body_first(self):
+        """Regression (2026-11-07, Windows): replying 403/401/413 without reading the request
+        body made Windows reset the connection, so clients saw WinError 10053 instead of the
+        response. The server must drain the body before answering."""
+        body = b'{"premises": ["p"], "conclusion": "p"}' + b" " * 20000
+        head = (b"POST /v1/verify-logic HTTP/1.1\r\nHost: attacker.example\r\nContent-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+            sock.sendall(head + body[:1000])
+            sock.settimeout(0.5)
+            with self.assertRaises(socket.timeout):            # still reading the body, not replying yet
+                sock.recv(1)
+            sock.settimeout(5)
+            sock.sendall(body[1000:])
+            reply = b""
+            while b"\r\n\r\n" not in reply:
+                reply += sock.recv(4096)
+        self.assertTrue(reply.startswith(b"HTTP/1.1 403"), reply[:40])
+
+    def test_lying_content_length_does_not_hang_the_server(self):
+        from cpu_platform import server as srv
+        original = srv.DRAIN_TIMEOUT_S
+        srv.DRAIN_TIMEOUT_S = 0.5
+        self.addCleanup(setattr, srv, "DRAIN_TIMEOUT_S", original)
+        head = (b"POST /v1/verify-logic HTTP/1.1\r\nHost: attacker.example\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 100000\r\n\r\n{}")
+        start = time.monotonic()
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+            sock.sendall(head)                                  # promises 100 kB, sends 2 bytes
+            reply = sock.recv(4096)
+        self.assertTrue(reply.startswith(b"HTTP/1.1 403"), reply[:40])
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertEqual(self.request("GET", "/healthz")[0], 200)   # server still serving
+
     def test_unsupported_methods_get_json_405(self):
         for method in ("PUT", "PATCH", "OPTIONS"):
             with self.subTest(method=method):
