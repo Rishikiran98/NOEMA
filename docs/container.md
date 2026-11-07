@@ -90,9 +90,16 @@ digest (`python@sha256:…`) for reproducible runs.
   cover the exact flags and mount, the environment, path rewriting, every probe failure refusing,
   Docker missing / engine down / image absent, `docker kill` on timeout, the output cap, no writes
   to the original repository, and the test runner through this backend.
-* **Real Docker: NOT RUN.** The `RealDocker` tests (probe, real network/root/filesystem isolation,
-  timeout, output cap, no writes, memory limit, test runner) are M3.2's acceptance criteria. M3.2
-  stays unticked until they pass on a real engine.
+* **Real Docker, 2026-11-07, user's Windows laptop:** Docker Desktop 4.98 (engine 29.9.2, WSL 2
+  kernel 6.18.54.1), image `python:3.12-slim` (`sha256:4840d514c583a4d3…`), code at `4b87d43`:
+  **all 5 `RealDocker` tests passed** (probe; no outbound connection, `/etc` not writable,
+  non-root, host home not visible; timeout, output cap, no writes to the original; 1 GiB
+  allocation refused at a 256 MiB limit; test runner in the container). The 14 fake-Docker tests
+  skip on Windows (POSIX-only), as expected. Docker Desktop's own HTTP proxy setting is
+  irrelevant inside these containers: they have no network.
+* Docker Desktop must be running first. With the engine stopped, NOEMA refuses with "Docker
+  engine not reachable", the same message `docker info` shows as "failed to connect to the docker API".
+* Not measured: per-run container start-up time; Linux hosts; rootless Docker.
 
 ## Not done in M3.2
 
