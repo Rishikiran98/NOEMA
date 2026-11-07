@@ -1,0 +1,2 @@
+# Frozen evaluation data and fixtures must be byte-identical on every OS: no CRLF conversion.
+data/** -text

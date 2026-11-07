@@ -224,7 +224,7 @@ class QuestionSet(unittest.TestCase):
 
     def test_frozen_and_well_formed(self):
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-        self.assertEqual(hashlib.sha256(QUESTIONS.read_bytes()).hexdigest(), manifest["sha256"],
+        self.assertEqual(rt.frozen_sha256(QUESTIONS), manifest["sha256"],
                          "noema_questions.jsonl changed: it is frozen (add a new versioned file instead)")
         rows = [json.loads(line) for line in QUESTIONS.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(rows), 40)
@@ -235,6 +235,21 @@ class QuestionSet(unittest.TestCase):
         for row in rows:
             for gold in row["gold_files"]:
                 self.assertTrue((REPO_ROOT / gold).is_file(), f"{row['id']}: gold file {gold} is missing")
+
+    def test_windows_line_endings_do_not_unfreeze_the_file(self):
+        """Regression (2026-11-07, Windows laptop): a CRLF checkout changed the raw SHA256 and
+        failed the frozen check although the content was identical."""
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "noema_questions.jsonl"
+            lf = QUESTIONS.read_bytes().replace(b"\r\n", b"\n")
+            copy.write_bytes(lf.replace(b"\n", b"\r\n"))
+            (Path(tmp) / "manifest.json").write_text(MANIFEST.read_text(encoding="utf-8"), encoding="utf-8")
+            self.assertEqual(len(rt.load_questions(copy, "dev")), 20)
+            # A real change is still refused, CRLF or not.
+            copy.write_bytes(lf.replace(b"DNS", b"dns").replace(b"\n", b"\r\n"))
+            with self.assertRaises(SystemExit):
+                rt.load_questions(copy, "dev")
+        self.assertEqual(hashlib.sha256(lf).hexdigest(), json.loads(MANIFEST.read_text(encoding="utf-8"))["sha256"])
 
     def test_tampered_question_file_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

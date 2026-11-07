@@ -204,11 +204,18 @@ DEFAULT_QUESTIONS = Path("data/retrieval/noema_questions.jsonl")
 EVAL_LOG = Path("data/retrieval/eval_runs.jsonl")
 
 
+def frozen_sha256(path: Path) -> str:
+    """SHA256 of a frozen text file with CRLF line endings read as LF. Git for Windows checks
+    files out with CRLF by default; the content (and the manifest hash, computed on LF) is
+    the same. Any other change, even one character, still changes the hash."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def load_questions(path: Path, split: str) -> list[dict]:
     manifest_path = path.parent / "manifest.json"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = frozen_sha256(path)
         if manifest.get("sha256") != digest:
             raise SystemExit(f"{path} does not match its frozen manifest SHA256; restore the original file")
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
