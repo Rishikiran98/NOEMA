@@ -39,11 +39,26 @@ py -m cpu_platform.patch try fix.diff --repo . --backend container      # apply 
 * `test_machinery`: added code **outside** tests that reaches into the test machinery
   (`os._exit`, assigning `sys.exit`, patching `unittest`/`pytest`/`builtins`, `sys.modules[...]`).
 * `other_changes`: after applying, the copy differs in files the patch did not name.
+* `recounted`, `no_line_numbers`, `fuzzy_context`: the diff was read leniently (below).
 
 ## How it applies
 
-Every hunk's context must match the copy **exactly**. A single unambiguous line offset is allowed
-(and reported); fuzz is not, and context that matches in more than one place is refused. Every
+A hunk whose context matches the copy **exactly** is applied where its header says, or at a single
+unambiguous offset (reported). Context that matches exactly in more than one place is refused.
+
+Real model diffs are often slightly wrong (first real run, 2026-11-07: every candidate for two of
+three fixtures was refused). So reading is lenient in bounded ways, each **flagged**, never silent:
+
+| Flag | What was wrong | What happens |
+|---|---|---|
+| `recounted` | `@@` counts disagree with the hunk body | the body is used, like `git apply --recount`. Before, an undercounting header silently dropped the extra lines |
+| `no_line_numbers` | `@@ @@` or `@@ ... @@` | placed by context alone |
+| `fuzzy_context` | context lines dropped or retyped (for example one blank line instead of two) | up to 2 unchanged context lines ignored at each end, then whitespace differences inside lines ignored |
+
+Limits on leniency: removed (`-`) lines are never ignored; indentation must still match exactly;
+a lenient placement must match exactly **one** place in the rest of the file (the header's line
+number does not break ties); unchanged lines are copied from the file, not from the model's text.
+Whatever was applied still has to pass the tests. Every
 file is computed before any file is written, so a patch either applies completely or not at all.
 Line endings (CRLF), missing final newlines (`\ No newline at end of file`), new files and
 deletions are handled. Afterwards `Sandbox.changes()` must match the patch.
@@ -62,7 +77,10 @@ refusal when a later file does not apply, offsets and ambiguity, CRLF and no-fin
 and the CLI refusing a patch that "fixes" a test by editing its expected value. Building it found
 and fixed a bug: a newly created file lost its final newline.
 
-Windows and real model-generated diffs: NOT RUN.
+Lenient reading (M3.5 follow-up): 10 more tests, including a dropped blank line, retyped
+whitespace, undercounted headers, no line numbers, and refusals for wrong removed lines, wrong
+indentation and ambiguous lenient placements. On Windows, all M3.4 tests passed at `78495c9`
+(before the lenient reading). Real-model diffs: see [fix-search.md](fix-search.md).
 
 ## Not done in M3.4
 

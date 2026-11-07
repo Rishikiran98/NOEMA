@@ -28,14 +28,14 @@ py -m cpu_platform.fix_search data\fix_fixtures\inventory_offbyone --backend con
    (`--no-stop-early` tries all N).
 
 Each candidate ends as `no_diff`, `rejected` (policy), `does_not_apply`, `targeted_failed`,
-`full_failed` or `passed`.
+`full_failed`, `passed` or `error` (the model call failed).
 
 ## What the `EngineResult` (task `repo_fix`) says
 
 | Section | Contents |
 |---|---|
 | `executions` | every test run: `B-X1` (baseline), `C<n>T-…` (targeted), `C<n>F-…` (full), with backend and `security_boundary` |
-| `checked_claims` | "before any patch, k selected tests fail"; per candidate "passes the patch policy", "the previously failing tests pass", "the full test suite passes", each verified or **refuted**, citing the execution or the candidate's answer |
+| `checked_claims` | "before any patch, k selected tests fail"; per candidate "passes the patch policy", "applies to the repository" (with any lenient reading named), "the previously failing tests pass", "the full test suite passes", each verified or **refuted**, citing the execution or the candidate's answer |
 | `unverified_claims` | "candidate n's patch fixes the bug": passing tests do not show that, and on `dev` the results could be forged |
 | `not_run` | fix correctness, candidates skipped (early stop, request budget, wall-time budget), unmeasured costs |
 | `answer` | the chosen diff, or null |
@@ -53,23 +53,38 @@ the fixtures out of NOEMA's own index.
 ## Measured
 
 Offline, with a scripted stand-in model (not a model): every candidate outcome, early stopping,
-smallest-diff choice, budgets, errors, contract validity, context ordering, and each fixture fixed
-by its reference patch through the search. 19 tests.
+smallest-diff choice, budgets, errors, contract validity, context ordering, each fixture fixed
+by its reference patch through the search, and by imperfect diffs of the kind the real model wrote.
+23 tests.
 
-**Real model: NOT RUN.** On the laptop, with the coder model on port 8080 and Docker Desktop running:
+**Real model, first run (user's laptop, 2026-11-07, `qwen3-coder-30b-a3b`, container backend, `-n 4`):**
+
+| Fixture | Result | Cost |
+|---|---|---|
+| `inventory_offbyone` | **passed**: candidate 1, `<` to `<=` (2 changed lines), targeted and full suites passed | 1 call, 658+103 tokens, 42 s model, 62 s total |
+| `pricing_wrong_constant` | 4/4 candidates `does_not_apply` | 4 calls, 51 s total |
+| `text_dropped_condition` | 4/4 candidates `malformed` | 4 calls, 75 s total |
+
+Both failures were in reading the model's diff, not in the tests. The raw answers were not
+captured, so the cause is inferred: the excerpts show a module's top-level lines without the
+blank lines between them, so a model writing context can drop a blank line, and models often
+miscount `@@` headers. The [patch reader](patch.md) is now lenient in bounded, flagged ways
+(recount, `@@ @@` headers, trimmed context or whitespace-insensitive placement, one match
+required), with offline tests for those exact mistakes on these fixtures. The CLI now prints
+why each candidate failed. `--show-answers` prints the raw answers (untrusted, made inert for
+the terminal). **Re-run after the fix: NOT RUN.**
 
 ```powershell
-py -m cpu_platform.fix_search data\fix_fixtures\inventory_offbyone --backend container --expect-model qwen3-coder-30b-a3b -n 4
+py -m cpu_platform.fix_search data\fix_fixtures\inventory_offbyone --backend container --expect-model qwen3-coder-30b-a3b -n 4 --show-answers
 ```
 ```powershell
-py -m cpu_platform.fix_search data\fix_fixtures\pricing_wrong_constant --backend container --expect-model qwen3-coder-30b-a3b -n 4
+py -m cpu_platform.fix_search data\fix_fixtures\pricing_wrong_constant --backend container --expect-model qwen3-coder-30b-a3b -n 4 --show-answers
 ```
 ```powershell
-py -m cpu_platform.fix_search data\fix_fixtures\text_dropped_condition --backend container --expect-model qwen3-coder-30b-a3b -n 4
+py -m cpu_platform.fix_search data\fix_fixtures\text_dropped_condition --backend container --expect-model qwen3-coder-30b-a3b -n 4 --show-answers
 ```
 
-Each model call takes about 1 to 3 minutes. Each prints every candidate's outcome, the checked
-claims, the chosen patch and the cost. Three hand-made fixtures say little about real
+Each model call takes about 10 s to 1 minute here. Three hand-made fixtures say little about real
 capability; M4.1's mutation benchmark is the measurement.
 
 ## Not done in M3.5

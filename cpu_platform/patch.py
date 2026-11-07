@@ -26,9 +26,15 @@ applied) or ``flag`` (applied, but reported). What is checked:
   characters (a Trojan Source patch);
 * **size:** files, changed lines and bytes per patch.
 
-Applying requires every hunk's context to match the sandbox copy exactly (a unique line offset
-is allowed, fuzz is not), computes every file before writing any, preserves line endings, and
-then confirms with ``Sandbox.changes()`` that exactly the patched files changed.
+Models write imperfect diffs, so reading and placing them is lenient in a few bounded ways,
+each reported as a ``flag`` (never silent): hunk header counts that disagree with the body are
+recounted from the body (like ``git apply --recount``); a header without line numbers is placed
+by its context alone; and a hunk whose context does not match exactly may be placed with up to
+FUZZ unchanged context lines ignored at each end, then with whitespace differences inside lines
+ignored (indentation still exact). A lenient placement must match exactly one place, removed
+lines are never ignored, and unchanged lines are always taken from the file, not the model.
+Applying computes every file before writing any, preserves line endings, and then confirms with
+``Sandbox.changes()`` that exactly the patched files changed.
 """
 from __future__ import annotations
 
@@ -45,6 +51,8 @@ from .injection import INVISIBLE
 from .repo_index import secret_name_reason
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+BARE_HUNK = re.compile(r"^@@(?: [^@\d-][^@]*| \.\.\.)? ?@@")   # "@@ @@", "@@ ... @@" (no numbers)
+FUZZ = 2                           # context lines that may be trimmed from each end of a hunk
 FENCE = re.compile(r"```(?:diff|patch|udiff)?[ \t]*\n(.*?)```", re.S)
 
 TEST_PATTERNS = ("tests/*", "test/*", "*/tests/*", "*/test/*", "test_*.py", "*/test_*.py", "*_test.py",
@@ -65,6 +73,7 @@ class Hunk:
     lines: list[str]               # each starts with ' ', '-' or '+'
     old_no_eol: bool = False       # "\ No newline at end of file" after an old line
     new_no_eol: bool = False
+    located: bool = True           # False: the header had no line numbers
 
 
 @dataclass
@@ -160,6 +169,7 @@ def parse(text: str) -> Patch:
         lines.pop()
     files: list[FilePatch] = []
     problems: list[Problem] = []
+    notes: list[Problem] = []        # flags: the diff was read leniently (see patch.md)
     pending: list[str] = []          # git extended headers before ---/+++
     i = 0
     while i < len(lines):
@@ -198,15 +208,24 @@ def parse(text: str) -> Patch:
             i += 2
             while i < len(lines) and lines[i].startswith("@@"):
                 m = HUNK.match(lines[i])
-                if not m:
+                if m:
+                    hunk = Hunk(int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1),
+                                int(m.group(3)), int(m.group(4) if m.group(4) is not None else 1), [])
+                elif BARE_HUNK.match(lines[i]):
+                    # "@@ @@" or "@@ ... @@": no line numbers. The hunk is placed by its context
+                    # alone (it must match exactly one place), and that is flagged.
+                    hunk = Hunk(0, -1, 0, -1, [], located=False)
+                    notes.append(Problem("flag", "no_line_numbers", fp.path,
+                                         "hunk header has no line numbers; placed by its context alone"))
+                else:
                     problems.append(Problem("reject", "malformed", fp.path, f"bad hunk header: {lines[i][:80]}"))
                     break
-                hunk = Hunk(int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1),
-                            int(m.group(3)), int(m.group(4) if m.group(4) is not None else 1), [])
                 i += 1
-                old_seen = new_seen = 0
-                while i < len(lines) and (old_seen < hunk.old_len or new_seen < hunk.new_len
-                                          or (i < len(lines) and lines[i].startswith("\\"))):
+                # The body runs to the next hunk/file header or the first line that is not a
+                # hunk line. Header counts are checked against it, not used to cut it short: a
+                # header that undercounts must not silently drop changed lines.
+                while i < len(lines) and not lines[i].startswith(("@@", "diff --git ")) \
+                        and not (lines[i].startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ ")):
                     body = lines[i]
                     if body.startswith("\\"):
                         last = hunk.lines[-1][:1] if hunk.lines else " "
@@ -218,24 +237,32 @@ def parse(text: str) -> Patch:
                         continue
                     if body == "":
                         body = " "          # some tools drop the space on empty context lines
-                    tag = body[0]
-                    if tag not in " -+":
+                    if body[0] not in " -+":
                         break
                     hunk.lines.append(body)
-                    old_seen += tag in " -"
-                    new_seen += tag in " +"
                     i += 1
-                if (old_seen, new_seen) != (hunk.old_len, hunk.new_len):
-                    problems.append(Problem("reject", "malformed", fp.path,
-                                            f"hunk counts do not match its header (-{hunk.old_len} +{hunk.new_len}, "
-                                            f"found -{old_seen} +{new_seen})"))
+                # Blank lines between the diff and the prose after it read as empty context lines;
+                # drop trailing ones the header does not count (all of them when it has no counts).
+                while hunk.lines and hunk.lines[-1] == " " and (
+                        hunk.old_len < 0 or sum(1 for l in hunk.lines if l[0] in " -") > hunk.old_len):
+                    hunk.lines.pop()
+                old_seen = sum(1 for l in hunk.lines if l[0] in " -")
+                new_seen = sum(1 for l in hunk.lines if l[0] in " +")
+                if not any(l[0] in "-+" for l in hunk.lines):
+                    problems.append(Problem("reject", "malformed", fp.path, "hunk has no changed lines"))
+                elif hunk.old_len >= 0 and (old_seen, new_seen) != (hunk.old_len, hunk.new_len):
+                    # Models often miscount. Like `git apply --recount`, trust the body, and say so.
+                    notes.append(Problem("flag", "recounted", fp.path,
+                                         f"hunk header said -{hunk.old_len} +{hunk.new_len}, body has "
+                                         f"-{old_seen} +{new_seen}; the body was used"))
+                hunk.old_len, hunk.new_len = old_seen, new_seen
                 fp.hunks.append(hunk)
             files.append(fp)
             continue
         i += 1
     if not files and not problems:
         problems.append(Problem("reject", "empty", None, "no unified diff found"))
-    return Patch(files, diff, problems)
+    return Patch(files, diff, problems + notes)
 
 
 # --------------------------------------------------------------------------- validation
@@ -340,43 +367,94 @@ def _split(text: str) -> tuple[list[str], str, bool]:
     return (body.split(newline) if text else []), newline, ends_with_newline
 
 
-def _apply_file(old_text: str, fp: FilePatch) -> tuple[str | None, list[int], str | None]:
-    """(new text, offsets, error)."""
+def _loose(line: str) -> str:
+    """Whitespace-insensitive form of a line: leading indentation kept exactly (it is syntax in
+    Python), other runs of whitespace collapsed, trailing whitespace dropped."""
+    body = line.lstrip(" \t")
+    return line[:len(line) - len(body)] + " ".join(body.split())
+
+
+def _attempts(h: Hunk):
+    """(hunk lines, trimmed context lines, loose) to try, strictest first. Only unchanged
+    context lines are ever trimmed (at most FUZZ from each end); changed lines never are."""
+    lead = next((k for k, l in enumerate(h.lines) if l[0] != " "), len(h.lines))
+    trail = next((k for k, l in enumerate(reversed(h.lines)) if l[0] != " "), len(h.lines))
+    trims = sorted({(a, b) for a in range(min(lead, FUZZ) + 1) for b in range(min(trail, FUZZ) + 1)},
+                   key=lambda t: (t[0] + t[1], t))
+    for loose in (False, True):
+        for a, b in trims:
+            yield h.lines[a:len(h.lines) - b], a, a + b, loose
+
+
+def _apply_file(old_text: str, fp: FilePatch) -> tuple[str | None, list[int], str | None, list[str]]:
+    """(new text, offsets, error, notes). Each hunk is placed exactly if possible; otherwise
+    with up to FUZZ context lines trimmed from each end, then whitespace-insensitively, and only
+    where it then matches exactly one place. Every lenient placement is reported in notes."""
     lines, newline, eol = _split(old_text)
+    loose_lines = [_loose(l) for l in lines]
     out: list[str] = []
     cursor = 0
     offsets = []
+    notes: list[str] = []
     final_eol = eol
     for h in fp.hunks:
-        old_block = [l[1:] for l in h.lines if l[0] in " -"]
-        new_block = [l[1:] for l in h.lines if l[0] in " +"]
-        want = max(h.old_start - 1, 0) if h.old_len else h.old_start
-        candidates = [want] if lines[want:want + len(old_block)] == old_block else []
-        if not candidates:
-            candidates = [s for s in range(cursor, len(lines) - len(old_block) + 1)
-                          if lines[s:s + len(old_block)] == old_block]
-            if len(candidates) != 1:
-                reason = "context not found" if not candidates else "context matches more than one place"
-                return None, offsets, f"hunk @@ -{h.old_start},{h.old_len} does not apply: {reason}"
-        start = candidates[0]
+        placed = None
+        for body, lead, trimmed, loose in _attempts(h):
+            old_block = [l[1:] for l in body if l[0] in " -"]
+            if trimmed and not old_block:
+                continue
+            haystack, needle = (loose_lines, [_loose(l) for l in old_block]) if loose else (lines, old_block)
+            lead_old = sum(1 for l in h.lines[:lead] if l[0] in " -")
+            want = (max(h.old_start - 1, 0) if h.old_len else h.old_start) + lead_old
+            # A strict hunk may sit where its header says even if its context recurs elsewhere;
+            # a lenient one must match exactly one place in the rest of the file.
+            if h.located and not (trimmed or loose) and haystack[want:want + len(needle)] == needle \
+                    and want >= cursor:
+                candidates = [want]
+            elif not needle:
+                candidates = []
+            else:
+                candidates = [s for s in range(cursor, len(lines) - len(needle) + 1)
+                              if haystack[s:s + len(needle)] == needle]
+            if len(candidates) == 1:
+                placed = (body, candidates[0], want, trimmed, loose, len(old_block))
+                break
+            if len(candidates) > 1 and not trimmed and not loose:
+                return None, offsets, f"hunk @@ -{h.old_start},{h.old_len} does not apply: context matches more than one place", notes
+        if placed is None:
+            return None, offsets, f"hunk @@ -{h.old_start},{h.old_len} does not apply: context not found", notes
+        body, start, want, trimmed, loose, old_count = placed
         if start < cursor:
-            return None, offsets, f"hunk @@ -{h.old_start},{h.old_len} overlaps the previous hunk"
-        offsets.append(start - want)
-        out += lines[cursor:start] + new_block
-        cursor = start + len(old_block)
+            return None, offsets, f"hunk @@ -{h.old_start},{h.old_len} overlaps the previous hunk", notes
+        if trimmed or loose:
+            notes.append(f"hunk @@ -{h.old_start},{h.old_len} placed leniently at line {start + 1}"
+                         + (f": {trimmed} context line(s) ignored" if trimmed else "")
+                         + ("; whitespace differences ignored" if loose else ""))
+        offsets.append(start - want if h.located else 0)
+        out += lines[cursor:start]
+        k = start
+        for l in body:                  # unchanged lines come from the file, not from the model
+            if l[0] == " ":
+                out.append(lines[k])
+                k += 1
+            elif l[0] == "-":
+                k += 1
+            else:
+                out.append(l[1:])
+        cursor = start + old_count
         if cursor == len(lines):
             # This hunk reaches the end of the file: the new side's "\ No newline at end of
             # file" marker alone decides how the file ends (new files included).
             final_eol = not h.new_no_eol
     out += lines[cursor:]
     if fp.deleted:
-        return "", offsets, None if not out else "deletion patch does not remove the whole file"
+        return "", offsets, (None if not out else "deletion patch does not remove the whole file"), notes
     text = newline.join(out)
     if out and final_eol:
         text += newline
     if fp.new_file and not out:
         text = ""
-    return text, offsets, None
+    return text, offsets, None, notes
 
 
 def apply(box, patch: Patch, policy: PatchPolicy = PatchPolicy()) -> ApplyResult:
@@ -388,16 +466,18 @@ def apply(box, patch: Patch, policy: PatchPolicy = PatchPolicy()) -> ApplyResult
     root = box.root.resolve()
     planned: dict[str, str | None] = {}
     offsets: dict[str, list[int]] = {}
+    fuzz: list[Problem] = []
     for fp in patch.files:
         target = (box.root / fp.path).resolve()
         if not target.is_relative_to(root):
             return ApplyResult(False, [], {}, check.problems + [Problem("reject", "path", fp.path, "escapes the copy")])
         old = "" if fp.new_file else target.read_bytes().decode("utf-8", errors="strict")
-        new, offs, error = _apply_file(old, fp)
+        new, offs, error, notes = _apply_file(old, fp)
         if error:
             return ApplyResult(False, [], {}, check.problems + [Problem("reject", "does_not_apply", fp.path, error)])
         planned[fp.path] = None if fp.deleted else new
         offsets[fp.path] = offs
+        fuzz += [Problem("flag", "fuzzy_context", fp.path, n) for n in notes]
     for path, content in planned.items():     # nothing is written until every file applied
         target = box.root / path
         if content is None:
@@ -407,7 +487,7 @@ def apply(box, patch: Patch, policy: PatchPolicy = PatchPolicy()) -> ApplyResult
             target.write_bytes(content.encode("utf-8"))
     changes = box.changes()
     touched = set(changes["created"]) | set(changes["modified"]) | set(changes["deleted"])
-    problems = list(check.problems)
+    problems = list(check.problems) + fuzz
     unexpected = touched - set(planned)
     if unexpected:
         problems.append(Problem("flag", "other_changes", None,

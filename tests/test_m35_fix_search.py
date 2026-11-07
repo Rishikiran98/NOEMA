@@ -285,7 +285,59 @@ class Fixtures(unittest.TestCase):
                         self.assertNotIn(line.strip(), text, f"{name}: the fix appears in {path}")
 
 
+# Diff mistakes of the kind a real model made on 2026-11-07 (all four candidates for two
+# fixtures ended does_not_apply / malformed): blank context lines dropped where the excerpt
+# showed only part of the module, whitespace retyped, header counts wrong.
+SLOPPY_FIXES = {
+    "pricing_wrong_constant": "--- a/pricing/tax.py\n+++ b/pricing/tax.py\n@@ -1,4 +1,4 @@\n"
+                              "-VAT_RATE = 0.02 # 20 % VAT\n+VAT_RATE = 0.20 # 20 % VAT\n \n"
+                              " def with_vat(net_cents: int) -> int:\n",
+    "text_dropped_condition": "--- a/textkit/slug.py\n+++ b/textkit/slug.py\n@@ -9,4 +9,5 @@\n"
+                              "     if len(slug) > max_length:\n         slug = slug[:max_length]\n"
+                              "-    return slug\n+    return slug.rstrip(\"-\")\n",
+}
+
+
+class SloppyDiffs(unittest.TestCase):
+    def test_fixtures_fixed_by_imperfect_but_unambiguous_diffs(self):
+        for name, diff in SLOPPY_FIXES.items():
+            with self.subTest(fixture=name):
+                search = fsx.FixSearch(Scripted(fenced(diff)), dev, candidates=1)
+                req = request_from_dict({"question": "q", "task": "repo_fix", "repo": {"path": name},
+                                         "allow_execution": True, "budget": {"max_model_calls": 1}})
+                result = search.run(req, FIXTURES / name)
+                self.assertEqual(result.status, "ok", search.candidates_tried[0].messages)
+                applies = [c for c in result.checked_claims if "applies to the repository" in c.claim]
+                self.assertEqual(applies[0].result, "verified")
+                self.assertIn("read leniently", applies[0].scope)
+
+    def test_a_diff_that_does_not_fit_is_refuted_as_applying(self):
+        stale = fenced("--- a/pricing/tax.py\n+++ b/pricing/tax.py\n@@ -1 +1 @@\n-VAT_RATE = 0.05\n+VAT_RATE = 0.20\n")
+        search = fsx.FixSearch(Scripted(stale), dev, candidates=1)
+        req = request_from_dict({"question": "q", "task": "repo_fix", "repo": {"path": "p"},
+                                 "allow_execution": True, "budget": {"max_model_calls": 1}})
+        result = search.run(req, FIXTURES / "pricing_wrong_constant")
+        claims = {c.claim: c.result for c in result.checked_claims}
+        self.assertEqual(claims["candidate 1's patch passes the patch policy"], "verified")
+        self.assertEqual(claims["candidate 1's patch applies to the repository"], "refuted")
+        self.assertEqual(search.candidates_tried[0].status, "does_not_apply")
+        self.assertIn("context not found", " ".join(search.candidates_tried[0].messages))
+
+
 class Cli(Repo):
+    def test_cli_shows_reasons_and_answers(self):
+        fake = FakeLlama("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf", accuracy=1.0, think_capable=False)
+        self.addCleanup(fake.close)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fsx.main([str(self.repo), "-n", "1", "--backend", "dev", "--i-understand-dev-is-not-isolated",
+                      "--model-url", fake.url, "--show-answers"])
+        text = out.getvalue()
+        self.assertIn("candidate 1: no_diff", text)
+        self.assertIn("no unified diff found", text)
+        self.assertIn("--- candidate 1 answer (untrusted model output) ---", text)
+        self.assertNotIn("\x1b", text)
+
     def test_cli_against_fake_llama(self):
         fake = FakeLlama("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf", accuracy=1.0, think_capable=False)
         self.addCleanup(fake.close)

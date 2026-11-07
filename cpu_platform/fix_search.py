@@ -37,6 +37,7 @@ from secrets import token_hex
 
 from cpu_first.core import ModelError
 from . import __version__
+from .injection import neutralize
 from .contract import (CheckedClaim, Cost, EngineRequest, EngineResult, ErrorInfo, Evidence, ExecutionRecord,
                        ModelInfo, NotRun, UnverifiedClaim, not_measured, validate_result)
 from .engine import UpstreamFailed, UpstreamUnavailable, upstream_error
@@ -61,6 +62,9 @@ Rules:
 - After the diff, at most two sentences on why the change fixes the failure."""
 
 
+LENIENT_CODES = ("recounted", "no_line_numbers", "fuzzy_context")
+
+
 @dataclass
 class Candidate:
     index: int
@@ -68,6 +72,8 @@ class Candidate:
     changed_lines: int = 0
     diff: str = ""
     problems: list[str] = field(default_factory=list)
+    messages: list[str] = field(default_factory=list)   # the problems in words
+    answer: str = ""                                    # the model's raw answer
     targeted: TestRun | None = None
     full: TestRun | None = None
     seed: int | None = None
@@ -296,6 +302,7 @@ class FixSearch:
                             unverified, not_run, cost, started, candidates=results)
 
     def _evaluate(self, cand: Candidate, answer: str, repo, targets, executions, checked, record, evidence) -> None:
+        cand.answer = answer
         patch = parse(answer)
         evidence.append(Evidence(id=f"P{cand.index}", kind="model_output", source=f"candidate {cand.index}",
                                  excerpt=answer[:4000], retrieved_by=f"temperature={cand.temperature},seed={cand.seed}"))
@@ -310,12 +317,21 @@ class FixSearch:
             # "does not apply" is a fit problem, not a policy violation.
             ok_policy = not any(p.severity == "reject" and p.code != "does_not_apply" for p in applied.problems)
             cand.problems = [f"{p.severity}:{p.code}:{p.path or ''}" for p in applied.problems]
+            cand.messages = [f"{p.severity} {p.code} {p.path or ''}: {p.message}" for p in applied.problems]
             checked.append(CheckedClaim(f"candidate {cand.index}'s patch passes the patch policy",
                                         "verified" if ok_policy else "refuted", "patch.validate",
                                         "paths, protected files (tests, CI, secrets, start-up hooks), size and "
                                         "content checks only; says nothing about whether the change is right",
                                         [f"P{cand.index}"],
                                         [p for p in cand.problems if p.startswith("reject")][:5]))
+            if ok_policy:
+                lenient = [p.message for p in applied.problems if p.code in LENIENT_CODES]
+                checked.append(CheckedClaim(f"candidate {cand.index}'s patch applies to the repository",
+                                            "verified" if applied.applied else "refuted", "patch.apply",
+                                            "every hunk matched the file in a fresh copy"
+                                            + (" (read leniently: " + "; ".join(lenient)[:300] + ")" if lenient else ""),
+                                            [f"P{cand.index}"],
+                                            [m for m in cand.messages if m.startswith("reject")][:5]))
             if not applied.applied:
                 cand.status = "rejected" if not ok_policy else "does_not_apply"
                 return
@@ -384,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-output-tokens", type=int, default=1024)
     parser.add_argument("--max-wall-seconds", type=float, default=3600)
     parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument("--show-answers", action="store_true",
+                        help="print each non-passing candidate's raw model answer (text format)")
     args = parser.parse_args(argv)
     expectation = None
     if args.expect_model:
@@ -410,10 +428,16 @@ def main(argv: list[str] | None = None) -> int:
             elif result.error.code == "local_model_mismatch":
                 print("hint: the loaded model or its context size differs from --expect-model (see the message)")
         for cand in search.candidates_tried:
-            print(f"  candidate {cand.index}: {cand.status} ({cand.changed_lines} changed lines)"
-                  + (f" {cand.problems[:2]}" if cand.problems else ""))
+            print(f"  candidate {cand.index}: {cand.status} ({cand.changed_lines} changed lines)")
+            for message in (cand.messages or cand.problems)[:4]:
+                print(f"      {message[:300]}")
         for claim in result.checked_claims:
             print(f"  [{claim.result}] {claim.claim}")
+        if args.show_answers:
+            for cand in search.candidates_tried:
+                if cand.status != "passed" and cand.answer:
+                    shown = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "?", neutralize(cand.answer)[0])  # no terminal escapes
+                    print(f"\n--- candidate {cand.index} answer (untrusted model output) ---\n{shown.rstrip()}")
         if result.answer:
             print("\nchosen patch (UNVERIFIED as a fix; tests passed in the sandbox):\n" + result.answer)
         c = result.cost
