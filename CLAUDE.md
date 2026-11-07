@@ -88,6 +88,7 @@ numbers, line counts or test counts.
 | `cpu_platform/container.py` | Docker sandbox backend: no network, read-only root, non-root, limits; claims `security_boundary` only after an in-container probe passes ([docs/container.md](docs/container.md)) |
 | `cpu_platform/testrun.py` | runs unittest/pytest in the sandbox, per-test outcomes and durations; results can be forged by malicious code (needs M3.2) ([docs/testrun.md](docs/testrun.md)) |
 | `cpu_platform/patch.py` | parse/validate/apply model diffs to a sandbox copy only; tests, CI, secrets and start-up hooks protected ([docs/patch.md](docs/patch.md)) |
+| `cpu_platform/fix_search.py` | propose-and-test: N model patches, each validated, applied to a fresh sandbox copy, targeted then full tests; smallest passing diff ([docs/fix-search.md](docs/fix-search.md)) |
 | `cpu_platform/launch.py`, `hardware.py` | hardware-aware CPU-only llama.cpp launcher |
 | `cpu_platform/jobs.py` | SQLite job queue |
 | `tests/fake_llama.py` | offline stand-in for llama.cpp's HTTP API (not a model) |

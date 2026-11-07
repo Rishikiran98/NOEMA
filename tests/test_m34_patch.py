@@ -82,8 +82,26 @@ class Parsing(unittest.TestCase):
 
     def test_malformed_and_empty(self):
         self.assertEqual(pt.parse("just prose, no diff").problems[0].code, "empty")
-        bad = pt.parse("--- a/x.py\n+++ b/x.py\n@@ -1,3 +1,3 @@\n-a\n+b\n")
+        bad = pt.parse("--- a/x.py\n+++ b/x.py\n@@ -x +1 @@\n-a\n+b\n")
         self.assertEqual(bad.problems[0].code, "malformed")
+        self.assertEqual(pt.parse("--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n a\n").problems[0].code, "malformed")
+        # Changed on purpose (M3.5, first real-model run): a miscounted header used to be
+        # rejected as malformed; it is now recounted from the body and flagged.
+        miscounted = pt.parse("--- a/x.py\n+++ b/x.py\n@@ -1,3 +1,3 @@\n-a\n+b\n")
+        self.assertEqual([(p.severity, p.code) for p in miscounted.problems], [("flag", "recounted")])
+        self.assertEqual((miscounted.files[0].hunks[0].old_len, miscounted.files[0].hunks[0].new_len), (1, 1))
+
+    def test_undercounted_header_never_drops_changed_lines(self):
+        # Before: the body was cut at the header's count, so "+    extra()" vanished silently.
+        p = pt.parse("--- a/x.py\n+++ b/x.py\n@@ -1,1 +1,1 @@\n-a\n+b\n+    extra()\n\nThis adds a call.\n")
+        (h,) = p.files[0].hunks
+        self.assertEqual(h.lines, ["-a", "+b", "+    extra()"])
+        self.assertIn(("flag", "recounted"), {(x.severity, x.code) for x in p.problems})
+
+    def test_header_without_line_numbers(self):
+        p = pt.parse("--- a/x.py\n+++ b/x.py\n@@ @@\n a\n-b\n+c\n")
+        self.assertFalse(p.files[0].hunks[0].located)
+        self.assertIn(("flag", "no_line_numbers"), {(x.severity, x.code) for x in p.problems})
 
 
 class Adversarial(Repo):
@@ -231,6 +249,78 @@ class Applying(Repo):
     def test_apply_only_accepts_a_sandbox(self):
         with self.assertRaises(AttributeError):
             pt.apply(str(self.repo), pt.parse(FIX))
+
+
+class Lenient(Repo):
+    """Diff mistakes seen from a real model (M3.5): miscounted headers, dropped or retyped context.
+    Each is applied only where it matches exactly one place, and always flagged."""
+
+    def apply(self, diff):
+        box = Sandbox(self.repo, DevBackend(acknowledge_not_isolated=True))
+        box.__enter__()
+        self.addCleanup(box.__exit__, None, None, None)
+        return box, pt.apply(box, pt.parse(diff))
+
+    def codes_of(self, result):
+        return {(p.severity, p.code) for p in result.problems}
+
+    def test_dropped_blank_context_line(self):
+        # CALC has two blank lines between the functions; the model wrote one.
+        diff = ("--- a/app/calc.py\n+++ b/app/calc.py\n@@ -2,5 +2,5 @@\n-    return a - b\n+    return a + b\n"
+                " \n def sub(a, b):\n")
+        box, result = self.apply(diff)
+        self.assertTrue(result.applied, result.problems)
+        self.assertIn(("flag", "fuzzy_context"), self.codes_of(result))
+        self.assertEqual((box.root / "app/calc.py").read_text(), CALC.replace("a - b", "a + b", 1))
+
+    def test_retyped_whitespace_inside_a_line(self):
+        (self.repo / "app/rate.py").write_text("RATE = 0.02   # 20 %\n\n\ndef f():\n    return RATE\n")
+        diff = "--- a/app/rate.py\n+++ b/app/rate.py\n@@ -1,3 +1,3 @@\n-RATE = 0.02 # 20 %\n+RATE = 0.20 # 20 %\n \n \n"
+        box, result = self.apply(diff)
+        self.assertTrue(result.applied, result.problems)
+        self.assertIn("whitespace", " ".join(p.message for p in result.problems))
+        self.assertEqual((box.root / "app/rate.py").read_text(), "RATE = 0.20 # 20 %\n\n\ndef f():\n    return RATE\n")
+
+    def test_context_lines_come_from_the_file_not_the_model(self):
+        (self.repo / "app/rate.py").write_text("x = 1\nRATE   =   2\ny = 3\n")
+        diff = "--- a/app/rate.py\n+++ b/app/rate.py\n@@ -1,3 +1,3 @@\n x = 1\n-RATE = 2\n+RATE = 3\n y  =  3\n"
+        box, result = self.apply(diff)
+        self.assertTrue(result.applied, result.problems)
+        self.assertEqual((box.root / "app/rate.py").read_text(), "x = 1\nRATE = 3\ny = 3\n")
+
+    def test_removed_lines_are_never_ignored(self):
+        diff = ("--- a/app/calc.py\n+++ b/app/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a / b\n"
+                "+    return a + b\n")
+        box, result = self.apply(diff)
+        self.assertFalse(result.applied)
+        self.assertIn(("reject", "does_not_apply"), self.codes_of(result))
+        self.assertEqual(box.changes(), {"created": [], "modified": [], "deleted": []})
+
+    def test_indentation_still_exact(self):
+        diff = "--- a/app/calc.py\n+++ b/app/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-  return a - b\n+  return a + b\n"
+        _, result = self.apply(diff)
+        self.assertFalse(result.applied)
+
+    def test_lenient_placement_must_be_unique(self):
+        # Both functions end in "return a - b"; with the distinguishing context line wrong,
+        # trimming it would leave a hunk that matches twice: refused, not guessed.
+        diff = "--- a/app/calc.py\n+++ b/app/calc.py\n@@ -1,2 +1,2 @@\n def mul(a, b):\n-    return a - b\n+    return a * b\n"
+        _, result = self.apply(diff)
+        self.assertFalse(result.applied)
+
+    def test_undercounted_header_applies_whole_body(self):
+        diff = ("--- a/app/calc.py\n+++ b/app/calc.py\n@@ -1,1 +1,1 @@\n def add(a, b):\n-    return a - b\n"
+                "+    return a + b\n\nThe sign was wrong.\n")
+        box, result = self.apply(diff)
+        self.assertTrue(result.applied, result.problems)
+        self.assertIn(("flag", "recounted"), self.codes_of(result))
+        self.assertEqual((box.root / "app/calc.py").read_text(), CALC.replace("a - b", "a + b", 1))
+
+    def test_no_line_numbers_placed_by_context(self):
+        diff = "--- a/app/calc.py\n+++ b/app/calc.py\n@@ ... @@\n def sub(a, b):\n-    return a - b\n+    return a - b + 0\n"
+        box, result = self.apply(diff)
+        self.assertTrue(result.applied, result.problems)
+        self.assertTrue((box.root / "app/calc.py").read_text().endswith("return a - b + 0\n"))
 
 
 class Cli(Repo):
