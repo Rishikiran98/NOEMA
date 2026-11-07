@@ -258,7 +258,9 @@ class NoemaSuiteRunsInside(unittest.TestCase):
         with sb.Sandbox(root, sb.DevBackend(acknowledge_not_isolated=True)) as box:
             r = box.run([PY, "-m", "unittest", "tests.test_m13_contract"], timeout=300).record
         self.assertEqual(r.exit_code, 0, r.stderr_tail)
-        self.assertTrue(r.stderr_tail.strip().endswith("OK"))
+        # "OK" or "OK (skipped=N)": optional tools (e.g. jsonschema) may be absent, as in a
+        # plain python image (seen 2026-11-07 in the container run).
+        self.assertRegex(r.stderr_tail.strip().splitlines()[-1], r"^OK( \(skipped=\d+\))?$")
         self.assertEqual(tree_digest(root / "cpu_platform"), before)
 
 
