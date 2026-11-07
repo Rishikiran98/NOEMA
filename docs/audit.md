@@ -76,8 +76,19 @@ Changing the repository afterwards breaks the affected reproductions and changes
 Also tested: unknown checkers, missing repository state, cut-off test summaries, Markdown fences
 around backticks, and span paths outside the repository.
 
+**By hand, user's laptop (Windows, 2026-11-07, `4311770`):** a real-model `fix_search` report
+(`pricing_wrong_constant`, `qwen3-coder-30b-a3b`, container backend). Each command printed in the
+report was run and gave the expected output:
+- `audit digest`: 3 files, git commit `4311770`, clean;
+- `testrun`: exactly `test_tax.VatTests.test_gross` and `test_vat_part` failed;
+- `patch check P1.txt`: `ok` true, flag `recounted`;
+- `patch try P1.txt --no-tests`: `applied` true, flags `recounted` and `fuzzy_context`;
+- `patch try D1.diff`: `applied` true with **no** flags (the clean diff), 3/3 tests passed.
+
+All five checks reproduced. The digest was not compared with the report's value in the pasted
+output, and the targeted (`--select`) claim was not repeated separately.
+
 Not measured:
-- A person reproducing a real-model report on the laptop: NOT RUN.
 - The cost of the repository digest. Every file is read and hashed once per request, so on
   large repositories it adds time that has not been measured.
 
