@@ -4,3 +4,5 @@ data/retrieval/
 data/injection/
 # Fix-search fixtures (M3.5): deliberately buggy repositories, not NOEMA code.
 data/fix_fixtures/
+# Injected-bug benchmark (M4.1): a vendored third-party repository and mutant diffs, not NOEMA code.
+data/bugbench/

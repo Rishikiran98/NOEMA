@@ -189,6 +189,8 @@ def selectors(test_ids: list[str], framework: str, root: Path) -> list[str] | No
         tid = match.group(1) if match else tid
         if not re.fullmatch(r"[A-Za-z_][\w.]*", tid) or tid.startswith("unittest."):
             return None
+        if not any(part.startswith("test") for part in tid.split(".")[:-1]):
+            return None              # e.g. a doctest id (package.module.function): not loadable by name
         if (root / "tests").is_dir() and not (root / "tests" / "__init__.py").is_file() \
                 and not tid.startswith("tests."):
             tid = "tests." + tid     # discovery under tests/ reports module-relative ids
@@ -205,9 +207,15 @@ class FixSearch:
         self.model, self.backend_factory = model, backend_factory
         self.candidates, self.stop_early, self.policy = candidates, stop_early, policy
         self.test_timeout, self.max_context_chars, self.seed = test_timeout, max_context_chars, seed
+        self._full_select: list[str] | None = None
 
     def run(self, request: EngineRequest, repo: str | Path, *, select: list[str] | None = None,
-            request_id: str | None = None) -> EngineResult:
+            request_id: str | None = None, full_select: list[str] | None = None,
+            index_db: str | Path | None = None) -> EngineResult:
+        """``full_select`` narrows the "full" run that confirms a candidate to these tests (the
+        benchmark uses the test modules of the mutated function); claims then say so.
+        ``index_db`` puts the repository index somewhere other than the default location."""
+        self._full_select = list(full_select) if full_select else None
         if request.task != "repo_fix":
             raise ValueError("FixSearch answers task 'repo_fix' only")
         if not request.allow_execution:
@@ -236,7 +244,7 @@ class FixSearch:
             return rec.id
 
         evidence.append(repository_evidence(repo))
-        with RepoIndex(repo, None) as index:
+        with RepoIndex(repo, index_db) as index:
             index.update()
             retriever = Retriever(index)
         with Sandbox(repo, self.backend_factory()) as box:
@@ -353,10 +361,10 @@ class FixSearch:
                                      excerpt=cand.diff[:4000], sha256=hashlib.sha256(cand.diff.encode("utf-8")).hexdigest(),
                                      retrieved_by="patch.applied_diff"))
             if targets is None:          # cannot target: the full run below is the only check
-                cand.full = run_tests(box, timeout=self.test_timeout)
-                fid = record(cand.full, f"C{cand.index}F", None, patch_id)
+                cand.full = run_tests(box, select=self._full_select, timeout=self.test_timeout)
+                fid = record(cand.full, f"C{cand.index}F", self._full_select, patch_id)
                 ok = cand.full.status == "passed"
-                checked.append(CheckedClaim(f"with candidate {cand.index} applied, the full test suite passes",
+                checked.append(CheckedClaim(f"with candidate {cand.index} applied, {self._scope_name()} passes",
                                             "verified" if ok else "refuted", f"testrun.{cand.full.framework}",
                                             "every collected test passed in the sandbox copy; does not show the code "
                                             "is correct or that the tests cover the bug", [fid, f"{fid[:60]}-T", patch_id]))
@@ -372,14 +380,19 @@ class FixSearch:
             if not ok:
                 cand.status = "targeted_failed"
                 return
-            cand.full = run_tests(box, timeout=self.test_timeout)
-            fid = record(cand.full, f"C{cand.index}F", None, patch_id)
+            cand.full = run_tests(box, select=self._full_select, timeout=self.test_timeout)
+            fid = record(cand.full, f"C{cand.index}F", self._full_select, patch_id)
             ok = cand.full.status == "passed"
-            checked.append(CheckedClaim(f"with candidate {cand.index} applied, the full test suite passes",
+            checked.append(CheckedClaim(f"with candidate {cand.index} applied, {self._scope_name()} passes",
                                         "verified" if ok else "refuted", f"testrun.{cand.full.framework}",
                                         "every collected test passed in the sandbox copy; does not show the code is "
                                         "correct or that the tests cover the bug", [fid, f"{fid[:60]}-T", patch_id]))
             cand.status = "passed" if ok else "full_failed"
+
+    def _scope_name(self) -> str:
+        if not self._full_select:
+            return "the full test suite"
+        return f"the test scope ({', '.join(self._full_select)[:300]})"
 
     def _model_error(self, exc, request_id, executions, evidence, checked, results, not_run, cost, started):
         code = getattr(exc, "code", "local_model_unavailable")

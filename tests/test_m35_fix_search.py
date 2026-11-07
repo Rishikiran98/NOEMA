@@ -102,6 +102,8 @@ class Selectors(unittest.TestCase):
             self.assertEqual(fsx.selectors(["test_calc.T.test_add", "setUpClass (test_calc.Broken)"], "unittest", root),
                              ["tests.test_calc.T.test_add", "tests.test_calc.Broken"])
             self.assertIsNone(fsx.selectors(["unittest.loader._FailedTest.test_x"], "unittest", root))
+            # A doctest id (package.module.function) cannot be loaded by name: run everything.
+            self.assertIsNone(fsx.selectors(["test_calc.T.test_add", "pkg.module.function"], "unittest", root))
             (root / "tests" / "__init__.py").write_text("")
             self.assertEqual(fsx.selectors(["tests.test_calc.T.test_add"], "unittest", root), ["tests.test_calc.T.test_add"])
             self.assertEqual(fsx.selectors(["test_calc.T.test_add", "test_calc.T.test_add"], "unittest", root),
@@ -154,6 +156,16 @@ class Search(Repo):
         self.assertIn(("with candidate 2 applied, the previously failing tests pass", "verified"), claims)
         self.assertIn(("with candidate 2 applied, the full test suite passes", "refuted"), claims)
         self.assertIn("fix", [n.item for n in result.not_run])
+
+    def test_scoped_full_run_says_so(self):
+        search = fsx.FixSearch(Scripted(GOOD), dev, candidates=1)
+        with tempfile.TemporaryDirectory() as idx:
+            result = search.run(self.request(1), self.repo, full_select=["tests.test_calc"],
+                                index_db=Path(idx) / "i.sqlite")
+            self.assertTrue((Path(idx) / "i.sqlite").is_file())
+        claims = [c.claim for c in result.checked_claims]
+        self.assertIn("with candidate 1 applied, the test scope (tests.test_calc) passes", claims)
+        self.assertFalse(any("full test suite" in c for c in claims))
 
     def test_executions_are_recorded_with_unique_ids(self):
         _, result = self.search(Scripted(WRONG, GOOD))

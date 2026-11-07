@@ -1,0 +1,11 @@
+{
+  "name": "more-itertools",
+  "version": "10.5.0",
+  "license": "MIT (see LICENSE)",
+  "source": "https://files.pythonhosted.org/packages/source/m/more-itertools/more-itertools-10.5.0.tar.gz",
+  "sdist_sha256": "5482bfef7849c25dc3c6dd53a6173ae4795da2a41a80faea6700d9f5846c5da6",
+  "copied": ["more_itertools/", "tests/", "LICENSE", "README.rst", "pyproject.toml"],
+  "omitted": ["docs/", "requirements/", "setup.py", "setup.cfg", "tox.ini", "Makefile", "MANIFEST.in", "PKG-INFO"],
+  "purpose": "pristine base for NOEMA's injected-bug benchmark (roadmap M4.1); never edited in place",
+  "fetched_utc": "2026-11-07"
+}
