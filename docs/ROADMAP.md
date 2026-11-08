@@ -54,6 +54,66 @@ questions, installers, auth, or external users.
 
 ---
 
+## Plan to v1.0 (agreed 2026-11-08)
+
+The order in which the remaining milestones are worked. The task lists below stay the source
+of truth for acceptance criteria; this section only sequences them.
+
+**Where things stand (2026-11-08):**
+- **M1:** done except M1.2 (laptop tokens/s).
+- **M2:** done except M2.1 (laptop index time).
+- **M3:** done; M3.5 stays open for the M4.3 comparison.
+- **M4.1:** the benchmark is built and frozen (277 mutants); its first real-model dev run
+  stopped with a model error (server not ready).
+- **M0:** not started; it no longer blocks anything.
+
+### Phase A: measure (M4)
+
+1. **Dev run of the bug benchmark** (laptop). Run 20 dev mutants with the model server confirmed
+   up (`/health` returns 200), then all 139.
+2. **Tune on dev only.** Change the prompt, context, candidate count and budgets from the dev
+   failures. Candidates to try: feeding a failed candidate's test output into the next attempt,
+   and removing duplicate candidates. Re-run dev after each change.
+3. **M4.2:** a repository-QA benchmark of at least 50 questions with gold files and lines,
+   frozen. It extends the 40 retrieval questions.
+4. **M4.3:** three baselines at matched CPU-seconds on both benchmarks: (a) the model alone,
+   (b) the model plus retrieval, (c) NOEMA in full. Paired results with bootstrap intervals,
+   then **one** eval run with settings frozen on dev, with the user's approval. This closes
+   M3.5.
+5. **M4.4:** a performance profile (p50/p95 latency, peak RAM, CPU-seconds, index time) that
+   sets the TBD release gates. The open laptop measurements (M1.2 tokens/s, M2.1 index time)
+   are taken at the same time.
+
+**Go/no-go after M4** (as below): if NOEMA in full does not beat the model plus retrieval at
+matched cost, revisit the search and verification design before M5.
+
+### Phase B: productize (M5), in this order
+
+1. **M5.4 installer:** Windows installer and Linux package, with a pinned llama.cpp build and
+   model hashes. No pilot can start without it.
+2. **M5.2 authentication and audit log:** API keys, roles, and a log of every request, fed by
+   the M3.6 audit reports.
+3. **M5.1 stable `/v2` API and Python SDK:** ask, fix and audit, plus a deprecation policy for
+   the `/v1` routes.
+4. **M5.3 security:** a threat model, tests against the OWASP LLM Top 10, secret redaction, and
+   signed audit reports (left open in M3.6).
+5. **M5.5 monitoring** (opt-in), then **M5.6 operations docs** (install, upgrade, retention).
+
+### Phase C: customers (M6)
+
+Three local pilots on real repositories. Their failures feed back into M2 to M4. Then the
+willingness-to-pay test and pricing, and v1.0 once every release gate is met.
+
+### Known gaps to close along the way
+
+- [ ] NOEMA's own tests let 76 of 193 injected bugs through in the M4.1 build (39%).
+  Strengthen them; this also makes the benchmark harder.
+- [ ] One unidentified test failed once (2026-11-07) and did not recur; find it if it returns.
+- [ ] No `/v2` endpoint for audit reports yet (CLI only).
+- [ ] Python repositories only; other languages wait until after v1.0 unless pilots need them.
+
+---
+
 ## M0: Evidence baseline (parallel with M1; runs on the user's laptop)
 
 Closes out the arithmetic research thread so its result informs the engine design.
@@ -195,3 +255,4 @@ One line per merged PR: `YYYY-MM-DD | task | change | measured result (or NOT RU
 - 2026-11-07 | M3.6 | `cpu_platform/audit.py`: Markdown + JSON report per request (`--audit DIR` on `fix_search` and `repo_qa`, `audit render` from saved files) with request, repository state (new evidence `repo`: tree SHA-256 of the files a sandbox copies, git commit/dirty), answer, patch, every checked claim with a reproduction recipe (commands + expected output; manual steps for v1 checkers; `reproducible: false` with the reason otherwise), citations, test results (new per-run evidence: selection, patch, counts, non-passing tests), commands, evidence, cost, NOT checked. Helpers: `audit digest`, `audit span`, `audit save`, `patch try --no-tests`; fix_search records each applied diff as evidence `D<n>`. 13 new tests (593 total): a scripted reader using only the saved JSON reproduces all 11 claims of a fix_search run and every citation claim of a repo_qa run (verified and refuted); editing the repository breaks the affected reproductions | Offline. A person reproducing a real-model report: NOT RUN. Digest cost on large repositories NOT MEASURED
 - 2026-11-07 | M3.6 reproduced by hand | User's laptop at `4311770`, real-model report for `pricing_wrong_constant` (container backend): the report's commands gave the expected output for the baseline (the same 2 failing tests), the policy check (`ok`, flag `recounted`), lenient apply of the model's diff (`applied`, 2 flags), and the applied diff `D1` (applies with no flags, 3/3 tests pass); `audit digest` 3 files, clean at `4311770` | Reproduced; digest equality with the report and the targeted-run claim not separately checked
 - 2026-11-07 | M4.1 | `cpu_platform/mutate.py` (5 AST operators as minimal source edits in function bodies) and `cpu_platform/bugbench.py` (build/check/run/status): bases NOEMA at `8e833cf` (git archive; 6 process/sandbox/network modules excluded) and more-itertools 10.5.0 (MIT, vendored with provenance); a mutant is kept only if the test modules naming its function pass on the base and fail with it; dev/eval split by function (seed 20261108), frozen with SHA-256; eval needs `--i-have-approval-for-eval` and is logged. **277 mutants** (NOEMA 117 of 193 tested, 76 survived; more-itertools 160 of 179, 15 survived, 4 timed out), dev 139 / eval 138, all 5 operators in both repos. fix_search gains a scoped confirming run (`full_select`), `index_db`, and doctest-id fallback. 21 new tests (614 total) | Build offline (dev backend, cloud). Oracle/null stand-ins: 1/1 and 0/n solved. Real model on dev: NOT RUN. Eval: not run (needs approval)
+- 2026-11-08 | planning | Added "Plan to v1.0": phase A measure (dev run, tuning on dev, M4.2, M4.3 with one approved eval run, M4.4), phase B productize (M5.4 → M5.2 → M5.1 → M5.3 → M5.5/M5.6), phase C pilots (M6), plus known gaps | Planning only; nothing measured
