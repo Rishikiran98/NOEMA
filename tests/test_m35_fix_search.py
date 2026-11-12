@@ -312,6 +312,25 @@ SLOPPY_FIXES = {
 }
 
 
+class CrlfRepository(Repo):
+    def test_reported_patch_has_no_carriage_returns_and_applies(self):
+        """Regression (Windows, 2026-11-12): a CRLF checkout put "\r" inside every line of the
+        regenerated diff, so it no longer applied."""
+        for rel in ("app/calc.py", "tests/test_calc.py"):
+            path = self.repo / rel
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        _, result = self.search(Scripted(GOOD), candidates=1)
+        self.assertEqual(result.status, "ok")
+        self.assertNotIn("\r", result.answer)
+        self.assertIn("-    return a - b\n+    return a + b\n", result.answer)
+        with Sandbox(self.repo, dev()) as box:
+            again = apply(box, parse(result.answer))
+            self.assertTrue(again.applied, again.problems)
+            self.assertEqual([p.code for p in again.problems], [])
+            self.assertEqual((box.root / "app/calc.py").read_bytes(),
+                             CALC.replace("a - b", "a + b", 1).replace("\n", "\r\n").encode())
+
+
 class AppliedDiff(unittest.TestCase):
     def test_unified_diff_round_trips_including_missing_final_newline(self):
         from cpu_platform.patch import unified_diff

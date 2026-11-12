@@ -203,9 +203,12 @@ def build_repo(spec: RepoSpec, base: Path, target: int, seed: int, backend_facto
             stats["tested"] += 1
             target_file = box.root / rel
             original = target_file.read_bytes()
-            source = original.decode("utf-8")
+            # Sites were computed on the text read with LF line endings; a CRLF checkout keeps
+            # its endings in the mutated file.
+            crlf = b"\r\n" in original
+            source = original.decode("utf-8").replace("\r\n", "\n")
             mutated = apply_site(source, site)
-            target_file.write_bytes(mutated.encode("utf-8"))
+            target_file.write_bytes((mutated.replace("\n", "\r\n") if crlf else mutated).encode("utf-8"))
             try:
                 run = run_tests(box, select=scope, timeout=timeout)
             finally:
@@ -409,6 +412,7 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
     out_path.write_text("", encoding="utf-8")
     with tempfile.TemporaryDirectory(prefix="noema-bugbench-run-") as tmp:
         bases = {}
+        consecutive = 0
         for n, m in enumerate(mutants, 1):
             if m["repo"] not in bases:
                 bases[m["repo"]] = materialize(spec_of(manifest, m["repo"]), Path(tmp) / "base" / m["repo"],
@@ -455,7 +459,12 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
                 + (" (exact restore)" if exact else "") + f", {row['model_calls']} call(s), {row['total_seconds']} s"
                 + (f"\n    error {row['error']}: {row['error_message']}" if row["error"] else ""))
             shutil.rmtree(work, ignore_errors=True)
-            if result.status == "error" and result.error and result.error.code.startswith("local_model"):
+            model_error = result.status == "error" and result.error and result.error.code.startswith("local_model")
+            consecutive = consecutive + 1 if model_error else 0
+            # A timed-out request is one slow mutant (a long prompt on CPU): go on. A refused
+            # connection, a model mismatch, or three model errors in a row mean the server is
+            # not usable: stop.
+            if model_error and ("timed out" not in result.error.message or consecutive >= 3):
                 log("stopping: the model server is not usable (is it running and loaded? check "
                     "Invoke-WebRequest http://127.0.0.1:8080/health; a 503 'Loading model' means wait)")
                 break
@@ -509,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--model-url", default="http://127.0.0.1:8080")
     r.add_argument("--expect-model")
     r.add_argument("--max-output-tokens", type=int, default=1024)
+    r.add_argument("--model-timeout", type=int, default=900, help="seconds per model request")
     r.add_argument("--out", default="bugbench_results.jsonl")
     r.add_argument("--audit", metavar="DIR")
     r.add_argument("--i-have-approval-for-eval", action="store_true", dest="allow_eval")
@@ -546,7 +556,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.expect_model:
         from .model_adapter import parse_expectation
         expectation = parse_expectation(args.expect_model)
-    summary = run(args.split, model=LazyLocalModel(args.model_url, expectation=expectation), backend_factory=factory,
+    summary = run(args.split, model=LazyLocalModel(args.model_url, expectation=expectation, timeout=args.model_timeout),
+                  backend_factory=factory,
                   candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out),
                   allow_eval=args.allow_eval, audit_dir=Path(args.audit) if args.audit else None,
                   max_output_tokens=args.max_output_tokens)

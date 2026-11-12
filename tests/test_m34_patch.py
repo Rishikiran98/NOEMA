@@ -251,6 +251,18 @@ class Applying(Repo):
             pt.apply(str(self.repo), pt.parse(FIX))
 
 
+class Crlf(Repo):
+    def test_unified_diff_of_crlf_files_is_lf_and_keeps_the_file_endings(self):
+        old = "a = 1\r\nb = 2\r\n"
+        diff = pt.unified_diff("app/x.py", old, old.replace("2", "3"))
+        self.assertNotIn("\r", diff)
+        (self.repo / "app/x.py").write_bytes(old.encode())
+        with Sandbox(self.repo, DevBackend(acknowledge_not_isolated=True)) as box:
+            result = pt.apply(box, pt.parse(diff))
+            self.assertTrue(result.applied, result.problems)
+            self.assertEqual((box.root / "app/x.py").read_bytes(), b"a = 1\r\nb = 3\r\n")
+
+
 class Lenient(Repo):
     """Diff mistakes seen from a real model (M3.5): miscounted headers, dropped or retyped context.
     Each is applied only where it matches exactly one place, and always flagged."""

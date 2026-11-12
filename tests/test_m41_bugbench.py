@@ -157,6 +157,21 @@ class Building(unittest.TestCase):
             self.assertIn(m["id"], set(manifest["dev"]) | set(manifest["eval"]))
         self.assertEqual(bb.check(self.root / "bench", self.root, run_tests_for=3, backend_factory=dev), [])
 
+    def test_crlf_checkout(self):
+        """Regression (Windows, 2026-11-12): sites computed on LF text were applied to CRLF bytes."""
+        for path in (self.root / "small").rglob("*.py"):
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        bench = self.root / "bench"
+        manifest = self.build(bench)
+        _, mutants = bb.load(None, bench)
+        self.assertTrue(mutants)
+        self.assertFalse(any("\r" in m["bug"] or "\r" in m["reference_fix"] for m in mutants))
+        self.assertEqual(bb.check(bench, self.root, run_tests_for=2, backend_factory=dev), [])
+        work = self.root / "work"
+        bb.materialize(bb.spec_of(manifest, "small"), work, root=self.root)
+        bb.apply_bug(work, mutants[0])
+        self.assertIn(b"\r\n", (work / mutants[0]["file"]).read_bytes())    # endings kept
+
     def test_deterministic_and_frozen(self):
         a = self.build(self.root / "a")
         b = self.build(self.root / "b")
@@ -224,6 +239,26 @@ class Building(unittest.TestCase):
         self.assertTrue(lines[-1].startswith("stopping: the model server is not usable"))
         row = json.loads((self.root / "d.jsonl").read_text().splitlines()[0])
         self.assertIn("connection refused", row["error_message"])
+
+    def test_a_timeout_does_not_stop_the_run_but_three_in_a_row_do(self):
+        from cpu_first.core import ModelTransportError
+        bench = self.root / "bench"
+        self.build(bench)
+        _, mutants = bb.load("dev", bench)
+
+        class Slow:
+            model = "slow"
+
+            def chat(self, *args, **kwargs):
+                raise ModelTransportError("timed out")
+
+        lines = []
+        bb.run("dev", model=Slow(), backend_factory=dev, candidates=1, out_path=self.root / "s.jsonl",
+               out_dir=bench, root=self.root, log=lines.append)
+        rows = (self.root / "s.jsonl").read_text().splitlines()
+        self.assertEqual(len(rows), min(3, len(mutants)))
+        if len(mutants) >= 3:
+            self.assertTrue(lines[-1].startswith("stopping:"))
 
     def test_eval_needs_approval_and_is_logged(self):
         bench = self.root / "bench"

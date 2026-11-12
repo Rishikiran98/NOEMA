@@ -428,6 +428,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expect-model")
     parser.add_argument("--no-stop-early", action="store_true")
     parser.add_argument("--max-output-tokens", type=int, default=1024)
+    parser.add_argument("--model-timeout", type=int, default=900,
+                        help="seconds per model request (a long prompt on CPU can take minutes)")
     parser.add_argument("--max-wall-seconds", type=float, default=3600)
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--audit", metavar="DIR", help="also write a Markdown and JSON audit report here (M3.6)")
@@ -442,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
                                  "task": "repo_fix", "repo": {"path": args.path}, "allow_execution": True,
                                  "budget": {"max_model_calls": args.candidates, "max_output_tokens": args.max_output_tokens,
                                             "max_wall_seconds": args.max_wall_seconds}})
-    search = FixSearch(LazyLocalModel(args.model_url, expectation=expectation),
+    search = FixSearch(LazyLocalModel(args.model_url, expectation=expectation, timeout=args.model_timeout),
                        lambda: make_backend(args.backend, args.ack, args.image),
                        candidates=args.candidates, stop_early=not args.no_stop_early)
     result = search.run(request, args.path, select=args.select or None)

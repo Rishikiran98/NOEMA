@@ -92,7 +92,7 @@ class LazyLocalModel:
     With an ``expectation`` (M1.4), the served model's identity, context size and optional
     file hash are checked on every (re)connect, before any request is answered.
     """
-    def __init__(self, url: str = "http://127.0.0.1:8080", expectation=None):
+    def __init__(self, url: str = "http://127.0.0.1:8080", expectation=None, timeout: int = 180):
         from urllib.parse import urlparse
         parsed = urlparse(url)
         if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
@@ -101,6 +101,7 @@ class LazyLocalModel:
             raise ValueError("Model URL must be a loopback HTTP origin")
         self.url = url.rstrip("/")
         self.expectation = expectation
+        self.timeout = timeout        # seconds per model request (long prompts on CPU need more)
         self.identity = None          # ModelIdentity once a connect has been verified
         self.last_problems: list[str] = []
         self._model: LocalLlama | None = None
@@ -110,7 +111,7 @@ class LazyLocalModel:
         if self._model is None:
             with self._lock:
                 if self._model is None:
-                    model = LocalLlama(self.url)
+                    model = LocalLlama(self.url, timeout=self.timeout)
                     if self.expectation is not None:
                         from .model_adapter import verify
                         try:
