@@ -160,7 +160,7 @@ class Building(unittest.TestCase):
     def test_crlf_checkout(self):
         """Regression (Windows, 2026-11-12): sites computed on LF text were applied to CRLF bytes."""
         for path in (self.root / "small").rglob("*.py"):
-            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+            path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))  # CRLF on any OS
         bench = self.root / "bench"
         manifest = self.build(bench)
         _, mutants = bb.load(None, bench)

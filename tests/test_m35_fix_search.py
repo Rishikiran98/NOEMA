@@ -318,7 +318,7 @@ class CrlfRepository(Repo):
         regenerated diff, so it no longer applied."""
         for rel in ("app/calc.py", "tests/test_calc.py"):
             path = self.repo / rel
-            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+            path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))  # CRLF on any OS
         _, result = self.search(Scripted(GOOD), candidates=1)
         self.assertEqual(result.status, "ok")
         self.assertNotIn("\r", result.answer)
