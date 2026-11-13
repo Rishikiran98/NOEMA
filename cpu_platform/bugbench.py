@@ -396,7 +396,8 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int | None = None, out_path: Path,
         out_dir: Path = BENCH_DIR, root: Path = Path("."), allow_eval: bool = False, audit_dir: Path | None = None,
-        max_output_tokens: int = 1024, ids: list[str] | None = None, log=print, search_factory=None) -> dict:
+        max_output_tokens: int = 1024, ids: list[str] | None = None, log=print, search_factory=None,
+        resume: bool = False) -> dict:
     from .contract import request_from_dict
     from .fix_search import FixSearch
     if split == "eval" and not allow_eval:
@@ -409,7 +410,19 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         mutants = mutants[:limit]
     rows = []
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("", encoding="utf-8")
+    if resume and split == "eval":
+        raise SystemExit("--resume is for dev runs; an eval run is one uninterrupted run")
+    if resume and out_path.is_file():
+        # Keep finished mutants; retry the ones a model error cut short.
+        wanted = {m["id"] for m in mutants}
+        previous = [r for r in read_jsonl(out_path) if r["id"] in wanted]
+        rows = [r for r in previous if not (r.get("error") or "").startswith("local_model")]
+        done = {r["id"] for r in rows}
+        mutants = [m for m in mutants if m["id"] not in done]
+        log(f"resuming: {len(done)} mutant(s) already in {out_path}, {len(mutants)} to run")
+        write_jsonl(out_path, rows)
+    else:
+        out_path.write_text("", encoding="utf-8")
     with tempfile.TemporaryDirectory(prefix="noema-bugbench-run-") as tmp:
         bases = {}
         consecutive = 0
@@ -494,8 +507,11 @@ def summarize(rows: list[dict]) -> dict:
     out = {"overall": block(rows), "by_repo": {}, "by_operator": {},
            "exact_restore": sum(1 for r in rows if r["exact_restore"]),
            "errors": sum(1 for r in rows if r["status"] == "error"),
-           "not_caught_here": sorted(r["id"] for r in rows if r.get("not_caught_here")),
+           "not_caught_here": sorted(r["id"] for r in rows if r.get("not_caught_here")
+                                     and r.get("error") != "baseline_failed"),
            "baseline_unusable": sorted(r["id"] for r in rows if r.get("error") == "baseline_failed"),
+           # How candidates ended, over every scored mutant: where tuning on dev should look.
+           "candidate_outcomes": dict(Counter(c for r in rows if not excluded(r) for c in r.get("candidates", []))),
            "errors_counted": sum(1 for r in rows if r["status"] == "error" and not excluded(r)),
            "model_calls": sum(r["model_calls"] for r in rows),
            "model_seconds": round(sum(r["model_seconds"] for r in rows), 1),
@@ -523,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--split", choices=("dev", "eval"), required=True)
     r.add_argument("--limit", type=int)
     r.add_argument("--ids", nargs="*")
+    r.add_argument("--resume", action="store_true",
+                   help="keep the mutants already in --out (dev only); retry those a model error cut short")
     r.add_argument("-n", "--candidates", type=int, default=4)
     r.add_argument("--model-url", default="http://127.0.0.1:8080")
     r.add_argument("--expect-model")
@@ -575,7 +593,7 @@ def main(argv: list[str] | None = None) -> int:
         expectation = parse_expectation(args.expect_model)
     summary = run(args.split, model=LazyLocalModel(args.model_url, expectation=expectation, timeout=args.model_timeout),
                   backend_factory=factory,
-                  candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out),
+                  candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out), resume=args.resume,
                   allow_eval=args.allow_eval, audit_dir=Path(args.audit) if args.audit else None,
                   max_output_tokens=args.max_output_tokens)
     print(json.dumps(summary, indent=2))

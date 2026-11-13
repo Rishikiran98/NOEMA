@@ -290,6 +290,10 @@ class Building(unittest.TestCase):
         out = bb.summarize(rows)
         self.assertEqual((out["overall"]["solved"], out["overall"]["attempted"]), (1, 2))
         self.assertEqual((out["baseline_unusable"], out["not_caught_here"], out["errors_counted"]), (["c"], ["d"], 0))
+        self.assertEqual(out["candidate_outcomes"], {})
+        rows[1]["candidates"] = ["does_not_apply", "targeted_failed"]
+        rows[2]["candidates"] = ["passed"]                                    # excluded: not counted
+        self.assertEqual(bb.summarize(rows)["candidate_outcomes"], {"does_not_apply": 1, "targeted_failed": 1})
         path = self.root / "r.jsonl"
         bb.write_jsonl(path, rows)
         import contextlib, io
@@ -297,6 +301,48 @@ class Building(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             bb.main(["summarize", str(path)])
         self.assertEqual(json.loads(buf.getvalue())["rows"], 4)
+
+    def test_resume_keeps_finished_mutants_and_retries_model_errors(self):
+        from cpu_first.core import ModelTransportError
+        bench = self.root / "bench"
+        self.build(bench)
+        _, mutants = bb.load("dev", bench)
+        first = mutants[0]["id"]
+        calls = []
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                calls.append("null")
+                return Completion("no", 0.1, 1, 1, None)
+
+        class Down:
+            model = "down"
+
+            def chat(self, *args, **kwargs):
+                calls.append("down")
+                raise ModelTransportError("connection refused")
+
+        out = self.root / "r.jsonl"
+        quiet = lambda *a: None    # noqa: E731
+        bb.run("dev", model=Down(), backend_factory=dev, candidates=1, ids=[first], out_path=out, out_dir=bench,
+               root=self.root, log=quiet)
+        self.assertEqual(bb.read_jsonl(out)[0]["error"], "local_model_unavailable")
+        bb.run("dev", model=Null(), backend_factory=dev, candidates=1, ids=[first], out_path=out, out_dir=bench,
+               root=self.root, log=quiet, resume=True)
+        rows = bb.read_jsonl(out)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["error"])                                     # the model error was retried
+        calls.clear()
+        summary = bb.run("dev", model=Down(), backend_factory=dev, candidates=1, ids=[first], out_path=out,
+                         out_dir=bench, root=self.root, log=quiet, resume=True)
+        self.assertEqual(calls, [])                                             # finished: not run again
+        self.assertEqual(bb.read_jsonl(out), rows)
+        self.assertEqual(summary["overall"]["attempted"], 1)
+        with self.assertRaises(SystemExit):
+            bb.run("eval", model=Null(), backend_factory=dev, out_path=out, out_dir=bench, root=self.root,
+                   allow_eval=True, resume=True)
 
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
