@@ -499,8 +499,11 @@ def apply(box, patch: Patch, policy: PatchPolicy = PatchPolicy()) -> ApplyResult
 def unified_diff(path: str, old: str | None, new: str | None, context: int = 3) -> str:
     """A standard unified diff of one file (None = the file does not exist), with exact header
     counts and "\\ No newline at end of file" markers, so ``git apply`` accepts it."""
-    old_lines = (old or "").splitlines(keepends=True)
-    new_lines = (new or "").splitlines(keepends=True)
+    # Line endings are compared as LF: a CRLF file (Windows checkout) would otherwise put a
+    # "\r" inside every diff line, and the diff would no longer apply. Applying keeps the
+    # file's own line endings, so nothing is lost.
+    old_lines = (old or "").replace("\r\n", "\n").splitlines(keepends=True)
+    new_lines = (new or "").replace("\r\n", "\n").splitlines(keepends=True)
     out = []
     for line in difflib.unified_diff(old_lines, new_lines, "/dev/null" if old is None else f"a/{path}",
                                      "/dev/null" if new is None else f"b/{path}", n=context):

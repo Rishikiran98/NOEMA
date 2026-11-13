@@ -102,6 +102,8 @@ class Selectors(unittest.TestCase):
             self.assertEqual(fsx.selectors(["test_calc.T.test_add", "setUpClass (test_calc.Broken)"], "unittest", root),
                              ["tests.test_calc.T.test_add", "tests.test_calc.Broken"])
             self.assertIsNone(fsx.selectors(["unittest.loader._FailedTest.test_x"], "unittest", root))
+            # A doctest id (package.module.function) cannot be loaded by name: run everything.
+            self.assertIsNone(fsx.selectors(["test_calc.T.test_add", "pkg.module.function"], "unittest", root))
             (root / "tests" / "__init__.py").write_text("")
             self.assertEqual(fsx.selectors(["tests.test_calc.T.test_add"], "unittest", root), ["tests.test_calc.T.test_add"])
             self.assertEqual(fsx.selectors(["test_calc.T.test_add", "test_calc.T.test_add"], "unittest", root),
@@ -154,6 +156,16 @@ class Search(Repo):
         self.assertIn(("with candidate 2 applied, the previously failing tests pass", "verified"), claims)
         self.assertIn(("with candidate 2 applied, the full test suite passes", "refuted"), claims)
         self.assertIn("fix", [n.item for n in result.not_run])
+
+    def test_scoped_full_run_says_so(self):
+        search = fsx.FixSearch(Scripted(GOOD), dev, candidates=1)
+        with tempfile.TemporaryDirectory() as idx:
+            result = search.run(self.request(1), self.repo, full_select=["tests.test_calc"],
+                                index_db=Path(idx) / "i.sqlite")
+            self.assertTrue((Path(idx) / "i.sqlite").is_file())
+        claims = [c.claim for c in result.checked_claims]
+        self.assertIn("with candidate 1 applied, the test scope (tests.test_calc) passes", claims)
+        self.assertFalse(any("full test suite" in c for c in claims))
 
     def test_executions_are_recorded_with_unique_ids(self):
         _, result = self.search(Scripted(WRONG, GOOD))
@@ -298,6 +310,25 @@ SLOPPY_FIXES = {
                               "     if len(slug) > max_length:\n         slug = slug[:max_length]\n"
                               "-    return slug\n+    return slug.rstrip(\"-\")\n",
 }
+
+
+class CrlfRepository(Repo):
+    def test_reported_patch_has_no_carriage_returns_and_applies(self):
+        """Regression (Windows, 2026-11-12): a CRLF checkout put "\r" inside every line of the
+        regenerated diff, so it no longer applied."""
+        for rel in ("app/calc.py", "tests/test_calc.py"):
+            path = self.repo / rel
+            path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))  # CRLF on any OS
+        _, result = self.search(Scripted(GOOD), candidates=1)
+        self.assertEqual(result.status, "ok")
+        self.assertNotIn("\r", result.answer)
+        self.assertIn("-    return a - b\n+    return a + b\n", result.answer)
+        with Sandbox(self.repo, dev()) as box:
+            again = apply(box, parse(result.answer))
+            self.assertTrue(again.applied, again.problems)
+            self.assertEqual([p.code for p in again.problems], [])
+            self.assertEqual((box.root / "app/calc.py").read_bytes(),
+                             CALC.replace("a - b", "a + b", 1).replace("\n", "\r\n").encode())
 
 
 class AppliedDiff(unittest.TestCase):
