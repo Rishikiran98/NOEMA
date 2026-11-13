@@ -475,11 +475,18 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
     return summary
 
 
+def excluded(row: dict) -> bool:
+    """Not a task on this machine, so not in the rate: the mutant's tests did not fail here, or
+    the baseline run could not be used (e.g. a mutant that exhausts memory is killed by the
+    container's limit before any result is written). Both are reported by id."""
+    return bool(row.get("not_caught_here")) or row.get("error") == "baseline_failed"
+
+
 def summarize(rows: list[dict]) -> dict:
     def block(sel):
         # A mutant whose tests do not fail on this machine (for example a test skipped in the
         # container image) is not a task here: reported, and left out of the rate.
-        sel = [r for r in sel if not r.get("not_caught_here")]
+        sel = [r for r in sel if not excluded(r)]
         k, n = sum(r["solved"] for r in sel), len(sel)
         lo, hi = wilson(k, n)
         return {"solved": k, "attempted": n, "rate": round(k / n, 3) if n else None,
@@ -488,6 +495,8 @@ def summarize(rows: list[dict]) -> dict:
            "exact_restore": sum(1 for r in rows if r["exact_restore"]),
            "errors": sum(1 for r in rows if r["status"] == "error"),
            "not_caught_here": sorted(r["id"] for r in rows if r.get("not_caught_here")),
+           "baseline_unusable": sorted(r["id"] for r in rows if r.get("error") == "baseline_failed"),
+           "errors_counted": sum(1 for r in rows if r["status"] == "error" and not excluded(r)),
            "model_calls": sum(r["model_calls"] for r in rows),
            "model_seconds": round(sum(r["model_seconds"] for r in rows), 1),
            "total_seconds": round(sum(r["total_seconds"] for r in rows), 1)}
@@ -523,11 +532,19 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--audit", metavar="DIR")
     r.add_argument("--i-have-approval-for-eval", action="store_true", dest="allow_eval")
     sub.add_parser("status", help="counts per repository, operator and split")
+    sm = sub.add_parser("summarize", help="recompute the summary from a results file (also a partial one)")
+    sm.add_argument("results")
     for p in (b, c, r):
         p.add_argument("--backend", choices=("dev", "container"), default="container" if p is r else "dev")
         p.add_argument("--image")
         p.add_argument("--i-understand-dev-is-not-isolated", action="store_true", dest="ack")
     args = parser.parse_args(argv)
+    if args.command == "summarize":
+        rows = read_jsonl(Path(args.results))
+        out = summarize(rows)
+        out["rows"] = len(rows)
+        print(json.dumps(out, indent=2))
+        return 0
     if args.command == "status":
         manifest, mutants = load()
         side = {i: "dev" for i in manifest["dev"]} | {i: "eval" for i in manifest["eval"]}

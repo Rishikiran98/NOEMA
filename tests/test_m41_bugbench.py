@@ -278,6 +278,26 @@ class Building(unittest.TestCase):
         self.assertEqual(summary["eval_run_number"], 1)
         self.assertTrue((bench / "eval_runs.jsonl").is_file())
 
+    def test_summary_leaves_out_mutants_that_are_not_tasks_here(self):
+        rows = [{"id": "a", "repo": "r", "operator": "o", "status": "ok", "solved": True, "exact_restore": True,
+                 "model_calls": 1, "model_seconds": 1.0, "total_seconds": 2.0},
+                {"id": "b", "repo": "r", "operator": "o", "status": "incomplete", "solved": False, "exact_restore": None,
+                 "model_calls": 4, "model_seconds": 4.0, "total_seconds": 5.0},
+                {"id": "c", "repo": "r", "operator": "o", "status": "error", "solved": False, "exact_restore": None,
+                 "error": "baseline_failed", "model_calls": 0, "model_seconds": 0.0, "total_seconds": 20.0},
+                {"id": "d", "repo": "r", "operator": "o", "status": "incomplete", "solved": False, "exact_restore": None,
+                 "not_caught_here": True, "model_calls": 0, "model_seconds": 0.0, "total_seconds": 3.0}]
+        out = bb.summarize(rows)
+        self.assertEqual((out["overall"]["solved"], out["overall"]["attempted"]), (1, 2))
+        self.assertEqual((out["baseline_unusable"], out["not_caught_here"], out["errors_counted"]), (["c"], ["d"], 0))
+        path = self.root / "r.jsonl"
+        bb.write_jsonl(path, rows)
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bb.main(["summarize", str(path)])
+        self.assertEqual(json.loads(buf.getvalue())["rows"], 4)
+
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
         lo, hi = bb.wilson(5, 10)
