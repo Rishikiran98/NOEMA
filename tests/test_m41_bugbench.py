@@ -344,6 +344,29 @@ class Building(unittest.TestCase):
             bb.run("eval", model=Null(), backend_factory=dev, out_path=out, out_dir=bench, root=self.root,
                    allow_eval=True, resume=True)
 
+    def test_an_unusable_sandbox_stops_the_run_cleanly(self):
+        from cpu_platform.sandbox import SandboxError
+        bench = self.root / "bench"
+        self.build(bench)
+
+        class NoDocker:
+            name = "container"
+
+            def __init__(self):
+                raise SandboxError("Docker engine not reachable (is Docker Desktop / dockerd running?)")
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                return Completion("no", 0.1, 1, 1, None)
+
+        lines = []
+        summary = bb.run("dev", model=Null(), backend_factory=NoDocker, candidates=1, out_path=self.root / "x.jsonl",
+                         out_dir=bench, root=self.root, log=lines.append)
+        self.assertEqual(summary["overall"]["attempted"], 0)
+        self.assertTrue(any("sandbox is not usable" in l and "Docker" in l for l in lines))
+
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
         lo, hi = bb.wilson(5, 10)

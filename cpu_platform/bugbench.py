@@ -48,7 +48,7 @@ from .datasets import log_eval_run
 from .mutate import OPERATORS, Site, apply_site, mutation_sites
 from .patch import _apply_file, parse, unified_diff
 from .retrieval import frozen_sha256
-from .sandbox import Sandbox, copy_selection
+from .sandbox import Sandbox, SandboxError, copy_selection
 from .testrun import run_tests
 
 BENCH_DIR = Path("data/bugbench")
@@ -440,8 +440,15 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
                                          "budget": {"max_model_calls": candidates, "max_output_tokens": max_output_tokens}})
             search = (search_factory or (lambda: FixSearch(model, backend_factory, candidates=candidates)))()
             started = time.perf_counter()
-            result = search.run(request, work, select=m["test_scope"], full_select=m["test_scope"],
-                                index_db=Path(tmp) / "index" / f"{m['id']}.sqlite")
+            try:
+                result = search.run(request, work, select=m["test_scope"], full_select=m["test_scope"],
+                                    index_db=Path(tmp) / "index" / f"{m['id']}.sqlite")
+            except SandboxError as exc:
+                # The sandbox itself is unusable (e.g. Docker is not running): every later mutant
+                # would fail the same way, so stop; finished rows are already saved.
+                log(f"stopping: the sandbox is not usable: {str(exc)[:300]}")
+                log("finished mutants are saved; fix the cause and re-run with --resume")
+                break
             exact = None
             if result.answer:
                 parsed = parse(result.answer)
