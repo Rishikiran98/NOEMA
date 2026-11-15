@@ -312,6 +312,35 @@ SLOPPY_FIXES = {
 }
 
 
+class FailureSplit(Repo):
+    """Why a candidate whose patch applied still failed: the original failures not fixed, or
+    other tests broken (M4.1 tuning needs the difference)."""
+
+    def test_not_fixed_and_broke_others(self):
+        search, _ = self.search(Scripted(WRONG, BREAKS_MUL), candidates=2, stop_early=False)
+        wrong, breaks = search.candidates_tried
+        self.assertEqual(wrong.status, "targeted_failed")
+        self.assertEqual((wrong.still_failing, wrong.new_failures), (["test_calc.T.test_add"], []))
+        self.assertEqual(breaks.status, "full_failed")
+        self.assertEqual((breaks.still_failing, breaks.new_failures), ([], ["test_calc.T.test_mul"]))
+        self.assertFalse(breaks.untargeted)
+        self.assertIn("+    return a + b", breaks.detail()["diff"])
+
+    def test_untargeted_when_a_doctest_fails(self):
+        doc_calc = ('def add(a, b):\n    """\n    >>> add(2, 3)\n    5\n    """\n    return a - b\n\n\n'
+                    'def mul(a, b):\n    return a * b\n')
+        (self.repo / "app/calc.py").write_text(doc_calc, encoding="utf-8")
+        (self.repo / "tests/test_calc.py").write_text(
+            TESTS + "\n\ndef load_tests(loader, tests, ignore):\n    import doctest, app.calc\n"
+                    "    tests.addTests(doctest.DocTestSuite(app.calc))\n    return tests\n", encoding="utf-8")
+        wrong = fenced("--- a/app/calc.py\n+++ b/app/calc.py\n@@ -6 +6 @@\n-    return a - b\n+    return a * b\n")
+        search, _ = self.search(Scripted(wrong), candidates=1)
+        (cand,) = search.candidates_tried
+        self.assertEqual((cand.status, cand.untargeted), ("full_failed", True))
+        self.assertIn("app.calc.add", cand.still_failing)
+        self.assertEqual(cand.new_failures, [])
+
+
 class CrlfRepository(Repo):
     def test_reported_patch_has_no_carriage_returns_and_applies(self):
         """Regression (Windows, 2026-11-12): a CRLF checkout put "\r" inside every line of the

@@ -464,6 +464,7 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
                    "solved": result.status == "ok", "exact_restore": exact, "baseline_failing": caught,
                    "not_caught_here": caught == 0,
                    "candidates": [c.status for c in getattr(search, "candidates_tried", [])],
+                   "candidate_details": [c.detail() for c in getattr(search, "candidates_tried", [])],
                    "model_calls": result.cost.model_calls, "prompt_tokens": result.cost.prompt_tokens,
                    "completion_tokens": result.cost.completion_tokens,
                    "model_seconds": result.cost.model_wall_seconds, "total_seconds": round(time.perf_counter() - started, 1),
@@ -502,6 +503,40 @@ def excluded(row: dict) -> bool:
     return bool(row.get("not_caught_here")) or row.get("error") == "baseline_failed"
 
 
+def failure_split(rows: list[dict]) -> dict:
+    """Candidates whose patch applied but whose tests failed, split by why:
+    ``not_fixed`` (the originally failing tests still fail, nothing else broke),
+    ``broke_others`` (the original failures pass, other tests now fail), ``both``, and
+    ``no_detail`` (rows from before this was recorded, or a run with no per-test results).
+    ``untargeted`` counts those whose failing tests could not be run on their own (doctests)."""
+    out = Counter()
+    for r in rows:
+        if excluded(r):
+            continue
+        details = r.get("candidate_details")
+        failed = [c for c in r.get("candidates", []) if c in ("full_failed", "targeted_failed")]
+        if details is None:
+            out["no_detail"] += len(failed)
+            continue
+        for c in details:
+            if c["status"] not in ("full_failed", "targeted_failed"):
+                continue
+            if c.get("untargeted"):
+                out["untargeted"] += 1
+            still, new = c.get("still_failing"), c.get("new_failures")
+            if still is None or new is None:
+                out["no_detail"] += 1
+            elif still and new:
+                out["both"] += 1
+            elif still:
+                out["not_fixed"] += 1
+            elif new:
+                out["broke_others"] += 1
+            else:
+                out["no_detail"] += 1        # failed, but no failing test was reported (e.g. a crash)
+    return {k: out.get(k, 0) for k in ("not_fixed", "broke_others", "both", "no_detail", "untargeted")}
+
+
 def summarize(rows: list[dict]) -> dict:
     def block(sel):
         # A mutant whose tests do not fail on this machine (for example a test skipped in the
@@ -519,6 +554,7 @@ def summarize(rows: list[dict]) -> dict:
            "baseline_unusable": sorted(r["id"] for r in rows if r.get("error") == "baseline_failed"),
            # How candidates ended, over every scored mutant: where tuning on dev should look.
            "candidate_outcomes": dict(Counter(c for r in rows if not excluded(r) for c in r.get("candidates", []))),
+           "failed_candidates": failure_split(rows),
            "errors_counted": sum(1 for r in rows if r["status"] == "error" and not excluded(r)),
            "model_calls": sum(r["model_calls"] for r in rows),
            "model_seconds": round(sum(r["model_seconds"] for r in rows), 1),

@@ -367,6 +367,20 @@ class Building(unittest.TestCase):
         self.assertEqual(summary["overall"]["attempted"], 0)
         self.assertTrue(any("sandbox is not usable" in l and "Docker" in l for l in lines))
 
+    def test_failure_split(self):
+        def cand(status, still=None, new=None, untargeted=False):
+            return {"status": status, "still_failing": still, "new_failures": new, "untargeted": untargeted}
+        base = {"repo": "r", "operator": "o", "solved": False, "exact_restore": None, "status": "incomplete",
+                "model_calls": 1, "model_seconds": 1.0, "total_seconds": 1.0}
+        rows = [dict(base, id="old", candidates=["full_failed", "targeted_failed", "does_not_apply"]),   # no details
+                dict(base, id="new", candidates=["full_failed"] * 4 + ["targeted_failed", "passed"],
+                     candidate_details=[cand("full_failed", ["t1"], [], True), cand("full_failed", [], ["t2"]),
+                                        cand("full_failed", ["t1"], ["t2"]), cand("full_failed", [], []),
+                                        cand("targeted_failed", ["t1"], []), cand("passed", [], [])])]
+        self.assertEqual(bb.failure_split(rows), {"not_fixed": 2, "broke_others": 1, "both": 1, "no_detail": 3,
+                                                  "untargeted": 1})
+        self.assertIn("failed_candidates", bb.summarize(rows))
+
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
         lo, hi = bb.wilson(5, 10)

@@ -78,7 +78,20 @@ For each mutant, `run`:
 The summary gives solved/attempted with a Wilson 95% interval overall, per repository and per
 operator. A mutant whose tests do not fail on that machine (for example, because a test is
 skipped in the container image) is reported under `not_caught_here` and left out of the rate.
-`--audit DIR` writes an [audit report](audit.md) per mutant.
+`--audit DIR` writes an [audit report](audit.md) per mutant. `--resume` keeps the mutants
+already in the results file (dev only) and retries those a model error cut short;
+`summarize RESULTS` recomputes the summary from a results file, including a partial one.
+
+The summary counts how candidates ended (`candidate_outcomes`). For candidates whose patch
+applied but whose tests failed, `failed_candidates` splits why:
+- `not_fixed`: the originally failing tests still fail and nothing else broke;
+- `broke_others`: the original failures pass, but other tests in scope now fail;
+- `both`;
+- `untargeted`: how many of these could not run the failing tests on their own (doctests).
+
+Each row keeps every candidate's applied diff and these test lists (`candidate_details`), so
+failures can be studied without calling the model again. Rows written before 2026-11-15 lack
+them and count as `no_detail`.
 
 ## What a solved mutant does NOT show
 
