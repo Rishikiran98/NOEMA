@@ -381,6 +381,67 @@ class Building(unittest.TestCase):
                                                   "untargeted": 1})
         self.assertIn("failed_candidates", bb.summarize(rows))
 
+    def test_a_damaged_base_copy_is_detected_and_rebuilt(self):
+        """Regression (laptop, 2026-11-15): a file vanished from the base copy in %TEMP% during a
+        long run; the next mutant crashed reading it. Now the base is checked and rebuilt."""
+        from cpu_platform.fix_search import FixSearch
+        bench = self.root / "bench"
+        self.build(bench)
+        _, mutants = bb.load("eval", bench)        # the small repository's eval side has 2 mutants
+        self.assertGreaterEqual(len(mutants), 2)
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                return Completion("no", 0.1, 1, 1, None)
+
+        class Vandal(FixSearch):
+            def run(self, request, repo, **kwargs):
+                result = super().run(request, repo, **kwargs)
+                victim = Path(repo).parent.parent / "base" / "small-1" / "pkg" / "ops.py"
+                if victim.exists():
+                    victim.unlink()                     # damage the base during the first mutant
+                return result
+
+        lines = []
+        summary = bb.run("eval", model=Null(), backend_factory=dev, candidates=1, allow_eval=True,
+                         out_path=self.root / "v.jsonl", out_dir=bench, root=self.root, log=lines.append,
+                         search_factory=lambda: Vandal(Null(), dev, candidates=1))
+        rows = bb.read_jsonl(self.root / "v.jsonl")
+        self.assertEqual(len(rows), len(mutants))
+        self.assertIsNone(rows[0]["base_repaired"])
+        self.assertEqual(rows[1]["base_repaired"], ["pkg/ops.py"])
+        self.assertTrue(any("damaged" in l and "rebuilding" in l for l in lines))
+        self.assertEqual(summary["overall"]["attempted"], len(mutants))
+        self.assertNotIn(True, [r.get("not_caught_here") for r in rows])     # the rebuilt base still has the bug
+
+    def test_redo_runs_chosen_mutants_again(self):
+        bench = self.root / "bench"
+        self.build(bench)
+        _, mutants = bb.load("dev", bench)
+        calls = []
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                calls.append(1)
+                return Completion("no", 0.1, 1, 1, None)
+
+        out = self.root / "r.jsonl"
+        quiet = lambda *a: None    # noqa: E731
+        bb.run("dev", model=Null(), backend_factory=dev, candidates=1, out_path=out, out_dir=bench, root=self.root,
+               log=quiet)
+        calls.clear()
+        bb.run("dev", model=Null(), backend_factory=dev, candidates=1, out_path=out, out_dir=bench, root=self.root,
+               log=quiet, resume=True)
+        self.assertEqual(calls, [])
+        bb.run("dev", model=Null(), backend_factory=dev, candidates=1, out_path=out, out_dir=bench, root=self.root,
+               log=quiet, resume=True, redo=[mutants[0]["id"]])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(bb.read_jsonl(out)), len(mutants))
+
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
         lo, hi = bb.wilson(5, 10)

@@ -119,6 +119,18 @@ def materialize(spec: RepoSpec, dest: Path, *, commit: str | None = None, root: 
     return dest
 
 
+def snapshot(base: Path) -> dict[str, str]:
+    """{relative path: SHA-256} of every file under a materialized base."""
+    return {p.relative_to(base).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(base.rglob("*")) if p.is_file() and "__pycache__" not in p.parts}
+
+
+def damaged(base: Path, pristine: dict[str, str]) -> list[str]:
+    """Files of the pristine base that are missing or changed ([] = intact)."""
+    now = snapshot(base)
+    return sorted(rel for rel, digest in pristine.items() if now.get(rel) != digest)
+
+
 def source_files(spec: RepoSpec, base: Path) -> list[str]:
     out = []
     for top in spec.sources:
@@ -397,7 +409,7 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int | None = None, out_path: Path,
         out_dir: Path = BENCH_DIR, root: Path = Path("."), allow_eval: bool = False, audit_dir: Path | None = None,
         max_output_tokens: int = 1024, ids: list[str] | None = None, log=print, search_factory=None,
-        resume: bool = False) -> dict:
+        resume: bool = False, redo: list[str] | None = None) -> dict:
     from .contract import request_from_dict
     from .fix_search import FixSearch
     if split == "eval" and not allow_eval:
@@ -416,24 +428,44 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         # Keep finished mutants; retry the ones a model error cut short.
         wanted = {m["id"] for m in mutants}
         previous = [r for r in read_jsonl(out_path) if r["id"] in wanted]
-        rows = [r for r in previous if not (r.get("error") or "").startswith("local_model")]
+        again = set(redo or [])
+        rows = [r for r in previous if not (r.get("error") or "").startswith("local_model") and r["id"] not in again]
         done = {r["id"] for r in rows}
         mutants = [m for m in mutants if m["id"] not in done]
-        log(f"resuming: {len(done)} mutant(s) already in {out_path}, {len(mutants)} to run")
+        log(f"resuming: {len(done)} mutant(s) already in {out_path}, {len(mutants)} to run"
+            + (f" (redoing {len(again & wanted)})" if again else ""))
         write_jsonl(out_path, rows)
     else:
         out_path.write_text("", encoding="utf-8")
     with tempfile.TemporaryDirectory(prefix="noema-bugbench-run-") as tmp:
         bases = {}
         consecutive = 0
+        pristine: dict[str, dict[str, str]] = {}
+        builds = Counter()
+
+        def fresh_base(repo: str) -> Path:
+            builds[repo] += 1
+            path = materialize(spec_of(manifest, repo), Path(tmp) / "base" / f"{repo}-{builds[repo]}",
+                               commit=manifest["repos"][repo]["commit"], root=root)
+            pristine[repo] = snapshot(path)
+            return path
+
         for n, m in enumerate(mutants, 1):
+            repaired = None
             if m["repo"] not in bases:
-                bases[m["repo"]] = materialize(spec_of(manifest, m["repo"]), Path(tmp) / "base" / m["repo"],
-                                               commit=manifest["repos"][m["repo"]]["commit"], root=root)
+                bases[m["repo"]] = fresh_base(m["repo"])
+            else:
+                # Laptop, 2026-11-15: a file vanished from the base copy in %TEMP% during a long
+                # run (cause outside NOEMA's code paths). Check before every mutant, and rebuild.
+                repaired = damaged(bases[m["repo"]], pristine[m["repo"]]) or None
+                if repaired:
+                    log(f"  base copy of {m['repo']} damaged ({len(repaired)} file(s), e.g. {repaired[0]}): rebuilding it")
+                    bases[m["repo"]] = fresh_base(m["repo"])
             work = Path(tmp) / "work" / m["id"]
             shutil.copytree(bases[m["repo"]], work)
             apply_bug(work, m)
             mutated = (work / m["file"]).read_text(encoding="utf-8")
+            original = (bases[m["repo"]] / m["file"]).read_text(encoding="utf-8")
             request = request_from_dict({"question": f"Make the failing tests in {m['repo']} pass",
                                          "task": "repo_fix", "repo": {"path": str(work)}, "allow_execution": True,
                                          "client_request_id": m["id"],
@@ -454,7 +486,6 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
                 parsed = parse(result.answer)
                 if len(parsed.files) == 1 and parsed.files[0].path == m["file"]:
                     fixed, _, error, _ = _apply_file(mutated, parsed.files[0])
-                    original = (bases[m["repo"]] / m["file"]).read_text(encoding="utf-8")
                     exact = error is None and fixed == original
                 else:
                     exact = False
@@ -465,6 +496,7 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
                    "not_caught_here": caught == 0,
                    "candidates": [c.status for c in getattr(search, "candidates_tried", [])],
                    "candidate_details": [c.detail() for c in getattr(search, "candidates_tried", [])],
+                   "base_repaired": repaired,
                    "model_calls": result.cost.model_calls, "prompt_tokens": result.cost.prompt_tokens,
                    "completion_tokens": result.cost.completion_tokens,
                    "model_seconds": result.cost.model_wall_seconds, "total_seconds": round(time.perf_counter() - started, 1),
@@ -582,6 +614,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--split", choices=("dev", "eval"), required=True)
     r.add_argument("--limit", type=int)
     r.add_argument("--ids", nargs="*")
+    r.add_argument("--redo", nargs="*", metavar="ID", help="with --resume: run these mutants again")
     r.add_argument("--resume", action="store_true",
                    help="keep the mutants already in --out (dev only); retry those a model error cut short")
     r.add_argument("-n", "--candidates", type=int, default=4)
@@ -636,7 +669,7 @@ def main(argv: list[str] | None = None) -> int:
         expectation = parse_expectation(args.expect_model)
     summary = run(args.split, model=LazyLocalModel(args.model_url, expectation=expectation, timeout=args.model_timeout),
                   backend_factory=factory,
-                  candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out), resume=args.resume,
+                  candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out), resume=args.resume, redo=args.redo,
                   allow_eval=args.allow_eval, audit_dir=Path(args.audit) if args.audit else None,
                   max_output_tokens=args.max_output_tokens)
     print(json.dumps(summary, indent=2))
