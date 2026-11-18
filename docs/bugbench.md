@@ -93,6 +93,15 @@ Each row keeps every candidate's applied diff and these test lists (`candidate_d
 failures can be studied without calling the model again. Rows written before 2026-11-15 lack
 them and count as `no_detail`.
 
+A run waits for the model server before it starts (it answers 503 while loading). On a 503 in
+the middle of a run it waits again and retries that mutant once. A refused connection or a model
+mismatch stops the run. Before every mutant the run checks its pristine base copy, and rebuilds
+it if anything is missing or changed (`base_repaired`).
+
+**Known weakness of the frozen build:** one failing run was enough to keep a mutant, so a flaky
+test can admit one that is not really caught (`nm-042093970d`). Such mutants report
+`not_caught_here` and are not scored. The next build should confirm each catch twice.
+
 ## What a solved mutant does NOT show
 
 - The tests in scope pass, nothing more. A patch can pass without restoring the original

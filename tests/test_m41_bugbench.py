@@ -442,6 +442,47 @@ class Building(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(bb.read_jsonl(out)), len(mutants))
 
+    def test_waits_for_a_loading_model_server_and_retries_a_503(self):
+        from cpu_first.core import ModelTransportError
+        bench = self.root / "bench"
+        self.build(bench)
+
+        class Loading:
+            """503 on the first call, then answers; not ready for the first two checks."""
+            model = "loading"
+
+            def __init__(self):
+                self.checks = self.calls = 0
+
+            def ready(self):
+                self.checks += 1
+                return self.checks > 2
+
+            def chat(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ModelTransportError("HTTP 503 from local model server")
+                return Completion("no", 0.1, 1, 1, None)
+
+        model, lines, naps = Loading(), [], []
+        import unittest.mock as mock
+        with mock.patch.object(bb.time, "sleep", naps.append):
+            summary = bb.run("dev", model=model, backend_factory=dev, candidates=1, out_path=self.root / "w.jsonl",
+                             out_dir=bench, root=self.root, log=lines.append)
+        self.assertTrue(naps)                                                   # waited before starting
+        self.assertTrue(any("answered 503" in l and "retrying" in l for l in lines))
+        self.assertEqual(summary["errors"], 0)
+        self.assertEqual(summary["overall"]["attempted"], 1)
+
+    def test_wait_ready_gives_up(self):
+        class Never:
+            def ready(self):
+                return False
+        t = [0.0]
+        self.assertFalse(bb.wait_ready(Never(), 30, log=lambda *a: None, sleep=lambda s: t.__setitem__(0, t[0] + s),
+                                       clock=lambda: t[0]))
+        self.assertTrue(bb.wait_ready(object(), 30))
+
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
         lo, hi = bb.wilson(5, 10)

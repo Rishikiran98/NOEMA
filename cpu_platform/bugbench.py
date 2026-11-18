@@ -406,10 +406,29 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (max(0.0, centre - half), min(1.0, centre + half))
 
 
+def wait_ready(model, max_wait: float, log=print, sleep=time.sleep, clock=time.monotonic) -> bool:
+    """Wait until the model server answers (llama.cpp returns 503 while it loads a model).
+    True if ready; a model without a readiness check counts as ready."""
+    ready = getattr(model, "ready", None)
+    if ready is None:
+        return True
+    deadline = clock() + max_wait
+    announced = False
+    while True:
+        if ready():
+            return True
+        if clock() >= deadline:
+            return False
+        if not announced:
+            log(f"waiting for the model server (up to {max_wait:.0f} s; it answers 503 while loading)...")
+            announced = True
+        sleep(10)
+
+
 def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int | None = None, out_path: Path,
         out_dir: Path = BENCH_DIR, root: Path = Path("."), allow_eval: bool = False, audit_dir: Path | None = None,
         max_output_tokens: int = 1024, ids: list[str] | None = None, log=print, search_factory=None,
-        resume: bool = False, redo: list[str] | None = None) -> dict:
+        resume: bool = False, redo: list[str] | None = None, ready_wait: float = 900) -> dict:
     from .contract import request_from_dict
     from .fix_search import FixSearch
     if split == "eval" and not allow_eval:
@@ -437,6 +456,8 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         write_jsonl(out_path, rows)
     else:
         out_path.write_text("", encoding="utf-8")
+    if mutants and not wait_ready(model, ready_wait, log):
+        log("the model server did not become ready; each mutant will report the error")
     with tempfile.TemporaryDirectory(prefix="noema-bugbench-run-") as tmp:
         bases = {}
         consecutive = 0
@@ -475,6 +496,14 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
             try:
                 result = search.run(request, work, select=m["test_scope"], full_select=m["test_scope"],
                                     index_db=Path(tmp) / "index" / f"{m['id']}.sqlite")
+                if (result.error and result.error.code.startswith("local_model") and "503" in result.error.message
+                        and wait_ready(model, ready_wait, log)):
+                    # The server was (re)loading: once it is ready, try this mutant again, once.
+                    log(f"  {m['id']}: the model server answered 503; it is ready now, retrying this mutant")
+                    search = (search_factory or (lambda: FixSearch(model, backend_factory, candidates=candidates)))()
+                    started = time.perf_counter()
+                    result = search.run(request, work, select=m["test_scope"], full_select=m["test_scope"],
+                                        index_db=Path(tmp) / "index" / f"{m['id']}.sqlite")
             except SandboxError as exc:
                 # The sandbox itself is unusable (e.g. Docker is not running): every later mutant
                 # would fail the same way, so stop; finished rows are already saved.
