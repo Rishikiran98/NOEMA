@@ -172,8 +172,21 @@ For the 73 failed candidates recorded with the split (all NOEMA), **all 73 were 
 and none `broke_others`.** The patches did not break other tests; they simply did not fix the
 bug.
 
-**Time.** The summary's time totals include three mutants of 19 to 25 hours from a suspended
-machine. Recompute them with `summarize` (it now leaves those out). Not yet recorded.
+**Time** (wall clock on the laptop). Three mutants are left out of these figures:
+`mi-b56606cdb2`, `nm-7fedb43711` and `nm-9e9e5b330e` took 19 to 25 hours each because the
+machine was suspended. Their results still count.
+
+| Measure | Value |
+|---|---|
+| Mutants timed | 136 of 139 |
+| Total time | 62,588 s (17.4 h) |
+| Model time | 58,643 s, **94%** of the total |
+| Median per mutant | 426 s |
+| Model calls | 297, about 197 s each |
+
+- About 900 s of wall time per solved mutant (62,588 s / 69). That is approximate: one
+  solved mutant is among the three left out.
+- CPU-seconds and peak RAM: NOT MEASURED.
 
 What this says, and does not:
 - It is one configuration of the M3.5 search, with no model-only or retrieval-only baseline
