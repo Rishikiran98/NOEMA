@@ -6,3 +6,4 @@ data/injection/
 data/fix_fixtures/
 # Injected-bug benchmark (M4.1): a vendored third-party repository and mutant diffs, not NOEMA code.
 data/bugbench/
+.bugbench-scratch/

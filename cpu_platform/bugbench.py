@@ -48,7 +48,7 @@ from .datasets import log_eval_run
 from .mutate import OPERATORS, Site, apply_site, mutation_sites
 from .patch import _apply_file, parse, unified_diff
 from .retrieval import frozen_sha256
-from .sandbox import Sandbox, copy_selection
+from .sandbox import Sandbox, SandboxError, copy_selection
 from .testrun import run_tests
 
 BENCH_DIR = Path("data/bugbench")
@@ -58,6 +58,7 @@ DEFAULT_TARGETS = {"noema": 160, "more_itertools": 160}
 MAX_MODULES = 3                   # a function mentioned by more test modules is too generic to target
 MAX_SCOPE_SECONDS = 20.0          # test scopes slower than this on the base are skipped
 MAX_PER_FUNCTION = 2
+SUSPECT_SECONDS = 4 * 3600        # one mutant: at most 4 candidates x 900 s model timeout, plus tests
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,18 @@ def materialize(spec: RepoSpec, dest: Path, *, commit: str | None = None, root: 
                 if member.isfile() and not member.name.startswith(("/", "..")) and ".." not in member.name.split("/"):
                     tar.extract(member, dest)
     return dest
+
+
+def snapshot(base: Path) -> dict[str, str]:
+    """{relative path: SHA-256} of every file under a materialized base."""
+    return {p.relative_to(base).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(base.rglob("*")) if p.is_file() and "__pycache__" not in p.parts}
+
+
+def damaged(base: Path, pristine: dict[str, str]) -> list[str]:
+    """Files of the pristine base that are missing or changed ([] = intact)."""
+    now = snapshot(base)
+    return sorted(rel for rel, digest in pristine.items() if now.get(rel) != digest)
 
 
 def source_files(spec: RepoSpec, base: Path) -> list[str]:
@@ -394,9 +407,54 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (max(0.0, centre - half), min(1.0, centre + half))
 
 
+def wait_ready(model, max_wait: float, log=print, sleep=time.sleep, clock=time.monotonic) -> bool:
+    """Wait until the model server answers (llama.cpp returns 503 while it loads a model).
+    True if ready; a model without a readiness check counts as ready."""
+    ready = getattr(model, "ready", None)
+    if ready is None:
+        return True
+    deadline = clock() + max_wait
+    announced = False
+    while True:
+        if ready():
+            return True
+        if clock() >= deadline:
+            return False
+        if not announced:
+            log(f"waiting for the model server (up to {max_wait:.0f} s; it answers 503 while loading)...")
+            announced = True
+        sleep(10)
+
+
 def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int | None = None, out_path: Path,
         out_dir: Path = BENCH_DIR, root: Path = Path("."), allow_eval: bool = False, audit_dir: Path | None = None,
-        max_output_tokens: int = 1024, ids: list[str] | None = None, log=print, search_factory=None) -> dict:
+        max_output_tokens: int = 1024, ids: list[str] | None = None, log=print, search_factory=None,
+        resume: bool = False, redo: list[str] | None = None, ready_wait: float = 900,
+        scratch: Path | None = None, max_wall_seconds: float = 600.0) -> dict:
+    """``scratch``: a folder for every temporary copy this run makes (base copies, work copies,
+    sandboxes, indexes) instead of the system temp folder, which Windows may clean up during a
+    long run (laptop, 2026-11-15 and 2026-11-20: files vanished from copies in %TEMP%)."""
+    if scratch is None:
+        return _run(split, model=model, backend_factory=backend_factory, candidates=candidates, limit=limit,
+                    out_path=out_path, out_dir=out_dir, root=root, allow_eval=allow_eval, audit_dir=audit_dir,
+                    max_output_tokens=max_output_tokens, ids=ids, log=log, search_factory=search_factory,
+                    resume=resume, redo=redo, ready_wait=ready_wait, max_wall_seconds=max_wall_seconds)
+    scratch = Path(scratch).resolve()
+    scratch.mkdir(parents=True, exist_ok=True)
+    previous = tempfile.tempdir
+    tempfile.tempdir = str(scratch)
+    try:
+        return _run(split, model=model, backend_factory=backend_factory, candidates=candidates, limit=limit,
+                    out_path=out_path, out_dir=out_dir, root=root, allow_eval=allow_eval, audit_dir=audit_dir,
+                    max_output_tokens=max_output_tokens, ids=ids, log=log, search_factory=search_factory,
+                    resume=resume, redo=redo, ready_wait=ready_wait, max_wall_seconds=max_wall_seconds)
+    finally:
+        tempfile.tempdir = previous
+
+
+def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path: Path, out_dir: Path, root: Path,
+         allow_eval: bool, audit_dir, max_output_tokens: int, ids, log, search_factory, resume: bool, redo,
+         ready_wait: float, max_wall_seconds: float = 600.0) -> dict:
     from .contract import request_from_dict
     from .fix_search import FixSearch
     if split == "eval" and not allow_eval:
@@ -409,32 +467,81 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         mutants = mutants[:limit]
     rows = []
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("", encoding="utf-8")
+    if resume and split == "eval":
+        raise SystemExit("--resume is for dev runs; an eval run is one uninterrupted run")
+    if resume and out_path.is_file():
+        # Keep finished mutants; retry the ones a model error cut short.
+        wanted = {m["id"] for m in mutants}
+        previous = [r for r in read_jsonl(out_path) if r["id"] in wanted]
+        again = set(redo or [])
+        rows = [r for r in previous if not (r.get("error") or "").startswith("local_model") and r["id"] not in again]
+        done = {r["id"] for r in rows}
+        mutants = [m for m in mutants if m["id"] not in done]
+        log(f"resuming: {len(done)} mutant(s) already in {out_path}, {len(mutants)} to run"
+            + (f" (redoing {len(again & wanted)})" if again else ""))
+        write_jsonl(out_path, rows)
+    else:
+        out_path.write_text("", encoding="utf-8")
+    if mutants and not wait_ready(model, ready_wait, log):
+        log("the model server did not become ready; each mutant will report the error")
     with tempfile.TemporaryDirectory(prefix="noema-bugbench-run-") as tmp:
         bases = {}
         consecutive = 0
+        pristine: dict[str, dict[str, str]] = {}
+        builds = Counter()
+
+        def fresh_base(repo: str) -> Path:
+            builds[repo] += 1
+            path = materialize(spec_of(manifest, repo), Path(tmp) / "base" / f"{repo}-{builds[repo]}",
+                               commit=manifest["repos"][repo]["commit"], root=root)
+            pristine[repo] = snapshot(path)
+            return path
+
         for n, m in enumerate(mutants, 1):
+            repaired = None
             if m["repo"] not in bases:
-                bases[m["repo"]] = materialize(spec_of(manifest, m["repo"]), Path(tmp) / "base" / m["repo"],
-                                               commit=manifest["repos"][m["repo"]]["commit"], root=root)
+                bases[m["repo"]] = fresh_base(m["repo"])
+            else:
+                # Laptop, 2026-11-15: a file vanished from the base copy in %TEMP% during a long
+                # run (cause outside NOEMA's code paths). Check before every mutant, and rebuild.
+                repaired = damaged(bases[m["repo"]], pristine[m["repo"]]) or None
+                if repaired:
+                    log(f"  base copy of {m['repo']} damaged ({len(repaired)} file(s), e.g. {repaired[0]}): rebuilding it")
+                    bases[m["repo"]] = fresh_base(m["repo"])
             work = Path(tmp) / "work" / m["id"]
             shutil.copytree(bases[m["repo"]], work)
             apply_bug(work, m)
             mutated = (work / m["file"]).read_text(encoding="utf-8")
+            original = (bases[m["repo"]] / m["file"]).read_text(encoding="utf-8")
             request = request_from_dict({"question": f"Make the failing tests in {m['repo']} pass",
                                          "task": "repo_fix", "repo": {"path": str(work)}, "allow_execution": True,
                                          "client_request_id": m["id"],
-                                         "budget": {"max_model_calls": candidates, "max_output_tokens": max_output_tokens}})
+                                         "budget": {"max_model_calls": candidates, "max_output_tokens": max_output_tokens,
+                                                    "max_wall_seconds": max_wall_seconds}})
             search = (search_factory or (lambda: FixSearch(model, backend_factory, candidates=candidates)))()
             started = time.perf_counter()
-            result = search.run(request, work, select=m["test_scope"], full_select=m["test_scope"],
-                                index_db=Path(tmp) / "index" / f"{m['id']}.sqlite")
+            try:
+                result = search.run(request, work, select=m["test_scope"], full_select=m["test_scope"],
+                                    index_db=Path(tmp) / "index" / f"{m['id']}.sqlite")
+                if (result.error and result.error.code.startswith("local_model") and "503" in result.error.message
+                        and wait_ready(model, ready_wait, log)):
+                    # The server was (re)loading: once it is ready, try this mutant again, once.
+                    log(f"  {m['id']}: the model server answered 503; it is ready now, retrying this mutant")
+                    search = (search_factory or (lambda: FixSearch(model, backend_factory, candidates=candidates)))()
+                    started = time.perf_counter()
+                    result = search.run(request, work, select=m["test_scope"], full_select=m["test_scope"],
+                                        index_db=Path(tmp) / "index" / f"{m['id']}.sqlite")
+            except SandboxError as exc:
+                # The sandbox itself is unusable (e.g. Docker is not running): every later mutant
+                # would fail the same way, so stop; finished rows are already saved.
+                log(f"stopping: the sandbox is not usable: {str(exc)[:300]}")
+                log("finished mutants are saved; fix the cause and re-run with --resume")
+                break
             exact = None
             if result.answer:
                 parsed = parse(result.answer)
                 if len(parsed.files) == 1 and parsed.files[0].path == m["file"]:
                     fixed, _, error, _ = _apply_file(mutated, parsed.files[0])
-                    original = (bases[m["repo"]] / m["file"]).read_text(encoding="utf-8")
                     exact = error is None and fixed == original
                 else:
                     exact = False
@@ -444,6 +551,8 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
                    "solved": result.status == "ok", "exact_restore": exact, "baseline_failing": caught,
                    "not_caught_here": caught == 0,
                    "candidates": [c.status for c in getattr(search, "candidates_tried", [])],
+                   "candidate_details": [c.detail() for c in getattr(search, "candidates_tried", [])],
+                   "base_repaired": repaired,
                    "model_calls": result.cost.model_calls, "prompt_tokens": result.cost.prompt_tokens,
                    "completion_tokens": result.cost.completion_tokens,
                    "model_seconds": result.cost.model_wall_seconds, "total_seconds": round(time.perf_counter() - started, 1),
@@ -469,17 +578,62 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
                     "Invoke-WebRequest http://127.0.0.1:8080/health; a 503 'Loading model' means wait)")
                 break
     summary = summarize(rows)
-    summary.update(split=split, manifest_sha256=manifest["sha256"], candidates=candidates, results=str(out_path))
+    # The per-mutant wall-time budget caps how many candidates actually run (the contract's
+    # default is 600 s; the first dev run used it without saying so).
+    summary.update(split=split, manifest_sha256=manifest["sha256"], candidates=candidates, results=str(out_path),
+                   budget={"max_model_calls": candidates, "max_output_tokens": max_output_tokens,
+                           "max_wall_seconds": max_wall_seconds})
     if split == "eval":
         summary["eval_run_number"] = log_eval_run({"utc": datetime.now(timezone.utc).isoformat(), **summary}, out_dir)
     return summary
+
+
+def excluded(row: dict) -> bool:
+    """Not a task on this machine, so not in the rate: the mutant's tests did not fail here, or
+    the baseline run could not be used (e.g. a mutant that exhausts memory is killed by the
+    container's limit before any result is written). Both are reported by id."""
+    return bool(row.get("not_caught_here")) or row.get("error") == "baseline_failed"
+
+
+def failure_split(rows: list[dict]) -> dict:
+    """Candidates whose patch applied but whose tests failed, split by why:
+    ``not_fixed`` (the originally failing tests still fail, nothing else broke),
+    ``broke_others`` (the original failures pass, other tests now fail), ``both``, and
+    ``no_detail`` (rows from before this was recorded, or a run with no per-test results).
+    ``untargeted`` counts those whose failing tests could not be run on their own (doctests)."""
+    out = Counter()
+    for r in rows:
+        if excluded(r):
+            continue
+        details = r.get("candidate_details")
+        failed = [c for c in r.get("candidates", []) if c in ("full_failed", "targeted_failed")]
+        if details is None:
+            out["no_detail"] += len(failed)
+            continue
+        for c in details:
+            if c["status"] not in ("full_failed", "targeted_failed"):
+                continue
+            if c.get("untargeted"):
+                out["untargeted"] += 1
+            still, new = c.get("still_failing"), c.get("new_failures")
+            if still is None or new is None:
+                out["no_detail"] += 1
+            elif still and new:
+                out["both"] += 1
+            elif still:
+                out["not_fixed"] += 1
+            elif new:
+                out["broke_others"] += 1
+            else:
+                out["no_detail"] += 1        # failed, but no failing test was reported (e.g. a crash)
+    return {k: out.get(k, 0) for k in ("not_fixed", "broke_others", "both", "no_detail", "untargeted")}
 
 
 def summarize(rows: list[dict]) -> dict:
     def block(sel):
         # A mutant whose tests do not fail on this machine (for example a test skipped in the
         # container image) is not a task here: reported, and left out of the rate.
-        sel = [r for r in sel if not r.get("not_caught_here")]
+        sel = [r for r in sel if not excluded(r)]
         k, n = sum(r["solved"] for r in sel), len(sel)
         lo, hi = wilson(k, n)
         return {"solved": k, "attempted": n, "rate": round(k / n, 3) if n else None,
@@ -487,10 +641,27 @@ def summarize(rows: list[dict]) -> dict:
     out = {"overall": block(rows), "by_repo": {}, "by_operator": {},
            "exact_restore": sum(1 for r in rows if r["exact_restore"]),
            "errors": sum(1 for r in rows if r["status"] == "error"),
-           "not_caught_here": sorted(r["id"] for r in rows if r.get("not_caught_here")),
+           "not_caught_here": sorted(r["id"] for r in rows if r.get("not_caught_here")
+                                     and r.get("error") != "baseline_failed"),
+           "baseline_unusable": sorted(r["id"] for r in rows if r.get("error") == "baseline_failed"),
+           # How candidates ended, over every scored mutant: where tuning on dev should look.
+           "candidate_outcomes": dict(Counter(c for r in rows if not excluded(r) for c in r.get("candidates", []))),
+           "failed_candidates": failure_split(rows),
+           "errors_counted": sum(1 for r in rows if r["status"] == "error" and not excluded(r)),
            "model_calls": sum(r["model_calls"] for r in rows),
            "model_seconds": round(sum(r["model_seconds"] for r in rows), 1),
            "total_seconds": round(sum(r["total_seconds"] for r in rows), 1)}
+    # Wall time includes any time the machine was suspended (laptop: single mutants of 19-25 h).
+    # Rows over SUSPECT_SECONDS are listed and left out of the time figures; results still count.
+    timed = [r for r in rows if r["total_seconds"] <= SUSPECT_SECONDS]
+    out["time_outliers"] = sorted(r["id"] for r in rows if r["total_seconds"] > SUSPECT_SECONDS)
+    seconds = sorted(r["total_seconds"] for r in timed)
+    out["time_without_outliers"] = {
+        "mutants": len(timed),
+        "model_seconds": round(sum(r["model_seconds"] for r in timed), 1),
+        "total_seconds": round(sum(seconds), 1),
+        "median_seconds_per_mutant": round(seconds[len(seconds) // 2], 1) if seconds else None,
+        "model_calls": sum(r["model_calls"] for r in timed)}
     for key, name in (("repo", "by_repo"), ("operator", "by_operator")):
         for value in sorted({r[key] for r in rows}):
             out[name][value] = block([r for r in rows if r[key] == value])
@@ -514,20 +685,36 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--split", choices=("dev", "eval"), required=True)
     r.add_argument("--limit", type=int)
     r.add_argument("--ids", nargs="*")
+    r.add_argument("--redo", nargs="*", metavar="ID", help="with --resume: run these mutants again")
+    r.add_argument("--scratch", metavar="DIR",
+                   help="folder for temporary copies instead of the system temp folder (Windows may clean that)")
+    r.add_argument("--resume", action="store_true",
+                   help="keep the mutants already in --out (dev only); retry those a model error cut short")
     r.add_argument("-n", "--candidates", type=int, default=4)
     r.add_argument("--model-url", default="http://127.0.0.1:8080")
     r.add_argument("--expect-model")
     r.add_argument("--max-output-tokens", type=int, default=1024)
+    r.add_argument("--max-wall-seconds", type=float, default=600.0,
+                   help="per-mutant wall-time budget; candidates not started before it runs out are skipped "
+                        "(600 s = the contract default, used by the first dev run)")
     r.add_argument("--model-timeout", type=int, default=900, help="seconds per model request")
     r.add_argument("--out", default="bugbench_results.jsonl")
     r.add_argument("--audit", metavar="DIR")
     r.add_argument("--i-have-approval-for-eval", action="store_true", dest="allow_eval")
     sub.add_parser("status", help="counts per repository, operator and split")
+    sm = sub.add_parser("summarize", help="recompute the summary from a results file (also a partial one)")
+    sm.add_argument("results")
     for p in (b, c, r):
         p.add_argument("--backend", choices=("dev", "container"), default="container" if p is r else "dev")
         p.add_argument("--image")
         p.add_argument("--i-understand-dev-is-not-isolated", action="store_true", dest="ack")
     args = parser.parse_args(argv)
+    if args.command == "summarize":
+        rows = read_jsonl(Path(args.results))
+        out = summarize(rows)
+        out["rows"] = len(rows)
+        print(json.dumps(out, indent=2))
+        return 0
     if args.command == "status":
         manifest, mutants = load()
         side = {i: "dev" for i in manifest["dev"]} | {i: "eval" for i in manifest["eval"]}
@@ -558,7 +745,8 @@ def main(argv: list[str] | None = None) -> int:
         expectation = parse_expectation(args.expect_model)
     summary = run(args.split, model=LazyLocalModel(args.model_url, expectation=expectation, timeout=args.model_timeout),
                   backend_factory=factory,
-                  candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out),
+                  candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out), resume=args.resume, redo=args.redo,
+                  scratch=Path(args.scratch) if args.scratch else None, max_wall_seconds=args.max_wall_seconds,
                   allow_eval=args.allow_eval, audit_dir=Path(args.audit) if args.audit else None,
                   max_output_tokens=args.max_output_tokens)
     print(json.dumps(summary, indent=2))

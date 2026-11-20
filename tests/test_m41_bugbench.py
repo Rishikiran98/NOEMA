@@ -278,6 +278,266 @@ class Building(unittest.TestCase):
         self.assertEqual(summary["eval_run_number"], 1)
         self.assertTrue((bench / "eval_runs.jsonl").is_file())
 
+    def test_summary_leaves_out_mutants_that_are_not_tasks_here(self):
+        rows = [{"id": "a", "repo": "r", "operator": "o", "status": "ok", "solved": True, "exact_restore": True,
+                 "model_calls": 1, "model_seconds": 1.0, "total_seconds": 2.0},
+                {"id": "b", "repo": "r", "operator": "o", "status": "incomplete", "solved": False, "exact_restore": None,
+                 "model_calls": 4, "model_seconds": 4.0, "total_seconds": 5.0},
+                {"id": "c", "repo": "r", "operator": "o", "status": "error", "solved": False, "exact_restore": None,
+                 "error": "baseline_failed", "model_calls": 0, "model_seconds": 0.0, "total_seconds": 20.0},
+                {"id": "d", "repo": "r", "operator": "o", "status": "incomplete", "solved": False, "exact_restore": None,
+                 "not_caught_here": True, "model_calls": 0, "model_seconds": 0.0, "total_seconds": 3.0}]
+        out = bb.summarize(rows)
+        self.assertEqual((out["overall"]["solved"], out["overall"]["attempted"]), (1, 2))
+        self.assertEqual((out["baseline_unusable"], out["not_caught_here"], out["errors_counted"]), (["c"], ["d"], 0))
+        self.assertEqual(out["candidate_outcomes"], {})
+        rows[1]["candidates"] = ["does_not_apply", "targeted_failed"]
+        rows[2]["candidates"] = ["passed"]                                    # excluded: not counted
+        self.assertEqual(bb.summarize(rows)["candidate_outcomes"], {"does_not_apply": 1, "targeted_failed": 1})
+        path = self.root / "r.jsonl"
+        bb.write_jsonl(path, rows)
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bb.main(["summarize", str(path)])
+        self.assertEqual(json.loads(buf.getvalue())["rows"], 4)
+
+    def test_resume_keeps_finished_mutants_and_retries_model_errors(self):
+        from cpu_first.core import ModelTransportError
+        bench = self.root / "bench"
+        self.build(bench)
+        _, mutants = bb.load("dev", bench)
+        first = mutants[0]["id"]
+        calls = []
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                calls.append("null")
+                return Completion("no", 0.1, 1, 1, None)
+
+        class Down:
+            model = "down"
+
+            def chat(self, *args, **kwargs):
+                calls.append("down")
+                raise ModelTransportError("connection refused")
+
+        out = self.root / "r.jsonl"
+        quiet = lambda *a: None    # noqa: E731
+        bb.run("dev", model=Down(), backend_factory=dev, candidates=1, ids=[first], out_path=out, out_dir=bench,
+               root=self.root, log=quiet)
+        self.assertEqual(bb.read_jsonl(out)[0]["error"], "local_model_unavailable")
+        bb.run("dev", model=Null(), backend_factory=dev, candidates=1, ids=[first], out_path=out, out_dir=bench,
+               root=self.root, log=quiet, resume=True)
+        rows = bb.read_jsonl(out)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["error"])                                     # the model error was retried
+        calls.clear()
+        summary = bb.run("dev", model=Down(), backend_factory=dev, candidates=1, ids=[first], out_path=out,
+                         out_dir=bench, root=self.root, log=quiet, resume=True)
+        self.assertEqual(calls, [])                                             # finished: not run again
+        self.assertEqual(bb.read_jsonl(out), rows)
+        self.assertEqual(summary["overall"]["attempted"], 1)
+        with self.assertRaises(SystemExit):
+            bb.run("eval", model=Null(), backend_factory=dev, out_path=out, out_dir=bench, root=self.root,
+                   allow_eval=True, resume=True)
+
+    def test_an_unusable_sandbox_stops_the_run_cleanly(self):
+        from cpu_platform.sandbox import SandboxError
+        bench = self.root / "bench"
+        self.build(bench)
+
+        class NoDocker:
+            name = "container"
+
+            def __init__(self):
+                raise SandboxError("Docker engine not reachable (is Docker Desktop / dockerd running?)")
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                return Completion("no", 0.1, 1, 1, None)
+
+        lines = []
+        summary = bb.run("dev", model=Null(), backend_factory=NoDocker, candidates=1, out_path=self.root / "x.jsonl",
+                         out_dir=bench, root=self.root, log=lines.append)
+        self.assertEqual(summary["overall"]["attempted"], 0)
+        self.assertTrue(any("sandbox is not usable" in l and "Docker" in l for l in lines))
+
+    def test_failure_split(self):
+        def cand(status, still=None, new=None, untargeted=False):
+            return {"status": status, "still_failing": still, "new_failures": new, "untargeted": untargeted}
+        base = {"repo": "r", "operator": "o", "solved": False, "exact_restore": None, "status": "incomplete",
+                "model_calls": 1, "model_seconds": 1.0, "total_seconds": 1.0}
+        rows = [dict(base, id="old", candidates=["full_failed", "targeted_failed", "does_not_apply"]),   # no details
+                dict(base, id="new", candidates=["full_failed"] * 4 + ["targeted_failed", "passed"],
+                     candidate_details=[cand("full_failed", ["t1"], [], True), cand("full_failed", [], ["t2"]),
+                                        cand("full_failed", ["t1"], ["t2"]), cand("full_failed", [], []),
+                                        cand("targeted_failed", ["t1"], []), cand("passed", [], [])])]
+        self.assertEqual(bb.failure_split(rows), {"not_fixed": 2, "broke_others": 1, "both": 1, "no_detail": 3,
+                                                  "untargeted": 1})
+        self.assertIn("failed_candidates", bb.summarize(rows))
+
+    def test_a_damaged_base_copy_is_detected_and_rebuilt(self):
+        """Regression (laptop, 2026-11-15): a file vanished from the base copy in %TEMP% during a
+        long run; the next mutant crashed reading it. Now the base is checked and rebuilt."""
+        from cpu_platform.fix_search import FixSearch
+        bench = self.root / "bench"
+        self.build(bench)
+        _, mutants = bb.load("eval", bench)        # the small repository's eval side has 2 mutants
+        self.assertGreaterEqual(len(mutants), 2)
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                return Completion("no", 0.1, 1, 1, None)
+
+        class Vandal(FixSearch):
+            def run(self, request, repo, **kwargs):
+                result = super().run(request, repo, **kwargs)
+                victim = Path(repo).parent.parent / "base" / "small-1" / "pkg" / "ops.py"
+                if victim.exists():
+                    victim.unlink()                     # damage the base during the first mutant
+                return result
+
+        lines = []
+        summary = bb.run("eval", model=Null(), backend_factory=dev, candidates=1, allow_eval=True,
+                         out_path=self.root / "v.jsonl", out_dir=bench, root=self.root, log=lines.append,
+                         search_factory=lambda: Vandal(Null(), dev, candidates=1))
+        rows = bb.read_jsonl(self.root / "v.jsonl")
+        self.assertEqual(len(rows), len(mutants))
+        self.assertIsNone(rows[0]["base_repaired"])
+        self.assertEqual(rows[1]["base_repaired"], ["pkg/ops.py"])
+        self.assertTrue(any("damaged" in l and "rebuilding" in l for l in lines))
+        self.assertEqual(summary["overall"]["attempted"], len(mutants))
+        self.assertNotIn(True, [r.get("not_caught_here") for r in rows])     # the rebuilt base still has the bug
+
+    def test_redo_runs_chosen_mutants_again(self):
+        bench = self.root / "bench"
+        self.build(bench)
+        _, mutants = bb.load("dev", bench)
+        calls = []
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                calls.append(1)
+                return Completion("no", 0.1, 1, 1, None)
+
+        out = self.root / "r.jsonl"
+        quiet = lambda *a: None    # noqa: E731
+        bb.run("dev", model=Null(), backend_factory=dev, candidates=1, out_path=out, out_dir=bench, root=self.root,
+               log=quiet)
+        calls.clear()
+        bb.run("dev", model=Null(), backend_factory=dev, candidates=1, out_path=out, out_dir=bench, root=self.root,
+               log=quiet, resume=True)
+        self.assertEqual(calls, [])
+        bb.run("dev", model=Null(), backend_factory=dev, candidates=1, out_path=out, out_dir=bench, root=self.root,
+               log=quiet, resume=True, redo=[mutants[0]["id"]])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(bb.read_jsonl(out)), len(mutants))
+
+    def test_waits_for_a_loading_model_server_and_retries_a_503(self):
+        from cpu_first.core import ModelTransportError
+        bench = self.root / "bench"
+        self.build(bench)
+
+        class Loading:
+            """503 on the first call, then answers; not ready for the first two checks."""
+            model = "loading"
+
+            def __init__(self):
+                self.checks = self.calls = 0
+
+            def ready(self):
+                self.checks += 1
+                return self.checks > 2
+
+            def chat(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ModelTransportError("HTTP 503 from local model server")
+                return Completion("no", 0.1, 1, 1, None)
+
+        model, lines, naps = Loading(), [], []
+        import unittest.mock as mock
+        with mock.patch.object(bb.time, "sleep", naps.append):
+            summary = bb.run("dev", model=model, backend_factory=dev, candidates=1, out_path=self.root / "w.jsonl",
+                             out_dir=bench, root=self.root, log=lines.append)
+        self.assertTrue(naps)                                                   # waited before starting
+        self.assertTrue(any("answered 503" in l and "retrying" in l for l in lines))
+        self.assertEqual(summary["errors"], 0)
+        self.assertEqual(summary["overall"]["attempted"], 1)
+
+    def test_wait_ready_gives_up(self):
+        class Never:
+            def ready(self):
+                return False
+        t = [0.0]
+        self.assertFalse(bb.wait_ready(Never(), 30, log=lambda *a: None, sleep=lambda s: t.__setitem__(0, t[0] + s),
+                                       clock=lambda: t[0]))
+        self.assertTrue(bb.wait_ready(object(), 30))
+
+    def test_scratch_folder_holds_every_copy(self):
+        import tempfile as tf
+        bench = self.root / "bench"
+        self.build(bench)
+        scratch = self.root / "scratch"
+        seen = []
+
+        class Peek:
+            model = "peek"
+
+            def chat(self, *args, **kwargs):
+                seen.append(tf.gettempdir())
+                return Completion("no", 0.1, 1, 1, None)
+
+        before = tf.gettempdir()
+        bb.run("dev", model=Peek(), backend_factory=dev, candidates=1, out_path=self.root / "s.jsonl", out_dir=bench,
+               root=self.root, log=lambda *a: None, scratch=scratch)
+        self.assertEqual(seen, [str(scratch.resolve())])
+        self.assertEqual(tf.gettempdir(), before)                         # restored afterwards
+        self.assertTrue(scratch.is_dir())
+
+    def test_suspended_mutants_are_left_out_of_time_figures(self):
+        base = {"repo": "r", "operator": "o", "status": "ok", "solved": True, "exact_restore": True, "model_calls": 1}
+        rows = [dict(base, id="a", model_seconds=100.0, total_seconds=200.0),
+                dict(base, id="b", model_seconds=150.0, total_seconds=300.0),
+                dict(base, id="slept", model_seconds=80000.0, total_seconds=81969.3)]
+        out = bb.summarize(rows)
+        self.assertEqual(out["overall"]["solved"], 3)                     # results still count
+        self.assertEqual(out["time_outliers"], ["slept"])
+        self.assertEqual(out["time_without_outliers"]["total_seconds"], 500.0)
+        self.assertEqual(out["time_without_outliers"]["median_seconds_per_mutant"], 300.0)
+
+    def test_wall_time_budget_is_passed_and_recorded(self):
+        from cpu_platform.fix_search import FixSearch
+        bench = self.root / "bench"
+        self.build(bench)
+        budgets = []
+
+        class Spy(FixSearch):
+            def run(self, request, repo, **kwargs):
+                budgets.append(request.budget.max_wall_seconds)
+                return super().run(request, repo, **kwargs)
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                return Completion("no", 0.1, 1, 1, None)
+
+        summary = bb.run("dev", model=Null(), backend_factory=dev, candidates=2, out_path=self.root / "b.jsonl",
+                         out_dir=bench, root=self.root, log=lambda *a: None, max_wall_seconds=3600,
+                         search_factory=lambda: Spy(Null(), dev, candidates=2))
+        self.assertEqual(set(budgets), {3600})
+        self.assertEqual(summary["budget"], {"max_model_calls": 2, "max_output_tokens": 1024, "max_wall_seconds": 3600})
+
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
         lo, hi = bb.wilson(5, 10)

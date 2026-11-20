@@ -15,3 +15,5 @@ results/*
 *.sqlite*
 *.db
 *.db.lock
+# Scratch folder for long benchmark runs (bugbench run --scratch .bugbench-scratch)
+.bugbench-scratch/

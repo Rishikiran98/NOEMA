@@ -78,7 +78,29 @@ For each mutant, `run`:
 The summary gives solved/attempted with a Wilson 95% interval overall, per repository and per
 operator. A mutant whose tests do not fail on that machine (for example, because a test is
 skipped in the container image) is reported under `not_caught_here` and left out of the rate.
-`--audit DIR` writes an [audit report](audit.md) per mutant.
+`--audit DIR` writes an [audit report](audit.md) per mutant. `--resume` keeps the mutants
+already in the results file (dev only) and retries those a model error cut short;
+`summarize RESULTS` recomputes the summary from a results file, including a partial one.
+
+The summary counts how candidates ended (`candidate_outcomes`). For candidates whose patch
+applied but whose tests failed, `failed_candidates` splits why:
+- `not_fixed`: the originally failing tests still fail and nothing else broke;
+- `broke_others`: the original failures pass, but other tests in scope now fail;
+- `both`;
+- `untargeted`: how many of these could not run the failing tests on their own (doctests).
+
+Each row keeps every candidate's applied diff and these test lists (`candidate_details`), so
+failures can be studied without calling the model again. Rows written before 2026-11-15 lack
+them and count as `no_detail`.
+
+A run waits for the model server before it starts (it answers 503 while loading). On a 503 in
+the middle of a run it waits again and retries that mutant once. A refused connection or a model
+mismatch stops the run. Before every mutant the run checks its pristine base copy, and rebuilds
+it if anything is missing or changed (`base_repaired`).
+
+**Known weakness of the frozen build:** one failing run was enough to keep a mutant, so a flaky
+test can admit one that is not really caught (`nm-042093970d`). Such mutants report
+`not_caught_here` and are not scored. The next build should confirm each catch twice.
 
 ## What a solved mutant does NOT show
 
@@ -116,4 +138,60 @@ Offline tests (stand-ins, not models):
 - the frozen benchmark itself: counts, a pristine vendored base, every bug and fix applies, and
   a sample is still caught.
 
-**Real model on dev: NOT RUN.** Eval: not run, and it needs the user's approval.
+**First real-model dev run (user's laptop, 2026-11-13 to 2026-11-20).**
+- Settings: `qwen3-coder-30b-a3b` (Q4_K_M, CPU only), container backend, `-n 4`, 1,024 output
+  tokens, and the contract's default **600 s wall-time budget per mutant**. That budget was not
+  set on purpose: it often stopped the search before all 4 candidates had run.
+- The run was resumed several times: Docker and the model server restarted, and the laptop
+  suspended.
+
+| | Solved | Rate | Wilson 95% |
+|---|---|---|---|
+| **All dev mutants** | **69 / 136** | **51%** | 42-59% |
+| more-itertools | 48 / 80 | 60% | 49-70% |
+| NOEMA | 21 / 56 | 38% | 26-51% |
+| flip_comparison | 20 / 42 | 48% | 33-62% |
+| off_by_one | 15 / 32 | 47% | 31-64% |
+| dropped_condition | 14 / 22 | 64% | 43-80% |
+| swapped_operands | 9 / 21 | 43% | 25-64% |
+| wrong_constant | 11 / 19 | 58% | 36-77% |
+
+- **Exact restores:** 38 of the 69 solved mutants.
+- **Not scored (3):** `mi-644a6a10cb` and `mi-876d98b4f7` (the baseline crashed: a mutant that
+  loops until memory runs out), and `nm-042093970d` (a flaky catch at build time).
+- **Unsolved by error (1):** `nm-e6b92b321e`, whose model call timed out; a `--resume` would
+  retry it.
+
+How the 304 candidates ended:
+- passed 69;
+- `targeted_failed` 98 and `full_failed` 72;
+- `does_not_apply` 46, `no_diff` 12, `rejected` 6. These 64 (21%) never reached the tests.
+- error 1.
+
+For the 73 failed candidates recorded with the split (all NOEMA), **all 73 were `not_fixed`
+and none `broke_others`.** The patches did not break other tests; they simply did not fix the
+bug.
+
+**Time** (wall clock on the laptop). Three mutants are left out of these figures:
+`mi-b56606cdb2`, `nm-7fedb43711` and `nm-9e9e5b330e` took 19 to 25 hours each because the
+machine was suspended. Their results still count.
+
+| Measure | Value |
+|---|---|
+| Mutants timed | 136 of 139 |
+| Total time | 62,588 s (17.4 h) |
+| Model time | 58,643 s, **94%** of the total |
+| Median per mutant | 426 s |
+| Model calls | 297, about 197 s each |
+
+- About 900 s of wall time per solved mutant (62,588 s / 69). That is approximate: one
+  solved mutant is among the three left out.
+- CPU-seconds and peak RAM: NOT MEASURED.
+
+What this says, and does not:
+- It is one configuration of the M3.5 search, with no model-only or retrieval-only baseline
+  (M4.3).
+- The gap between NOEMA and more-itertools may partly be contamination: more-itertools is
+  public and likely in the model's training data.
+
+**Eval: not run, and it needs the user's approval.**

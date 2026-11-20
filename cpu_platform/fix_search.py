@@ -79,6 +79,17 @@ class Candidate:
     full: TestRun | None = None
     seed: int | None = None
     temperature: float = 0.0
+    # After a failed confirming run: which of the tests that failed before the patch still
+    # fail, and which tests fail now that passed before (the patch broke them). None = not run.
+    still_failing: list[str] | None = None
+    new_failures: list[str] | None = None
+    untargeted: bool = False        # the failing tests could not be run on their own (e.g. doctests)
+
+    def detail(self) -> dict:
+        return {"index": self.index, "status": self.status, "changed_lines": self.changed_lines,
+                "untargeted": self.untargeted,
+                "still_failing": self.still_failing, "new_failures": self.new_failures,
+                "diff": self.diff[:4000] or None}
 
 
 def _rel(path: str, roots: list[str]) -> str | None:
@@ -208,6 +219,7 @@ class FixSearch:
         self.candidates, self.stop_early, self.policy = candidates, stop_early, policy
         self.test_timeout, self.max_context_chars, self.seed = test_timeout, max_context_chars, seed
         self._full_select: list[str] | None = None
+        self._baseline_failing: set[str] = set()
 
     def run(self, request: EngineRequest, repo: str | Path, *, select: list[str] | None = None,
             request_id: str | None = None, full_select: list[str] | None = None,
@@ -253,6 +265,7 @@ class FixSearch:
             shown, failing_ids = failure_context(baseline, retriever, box, self.max_context_chars)
             backend_name, boundary = box.backend.name, box.backend.security_boundary
         failing = [t for t in baseline.tests if t.outcome in ("failed", "error")]
+        self._baseline_failing = {t.id for t in failing}
         checked.append(CheckedClaim(
             f"before any patch, {len(failing)} selected test(s) fail", "verified", f"testrun.{baseline.framework}",
             f"observed in the {backend_name} sandbox; does not show why they fail", [base_id, f"{base_id[:60]}-T"]))
@@ -369,6 +382,8 @@ class FixSearch:
                                             "every collected test passed in the sandbox copy; does not show the code "
                                             "is correct or that the tests cover the bug", [fid, f"{fid[:60]}-T", patch_id]))
                 cand.status = "passed" if ok else "full_failed"
+                cand.untargeted = True
+                self._classify(cand, cand.full)
                 return
             cand.targeted = run_tests(box, select=targets, timeout=self.test_timeout)
             tid = record(cand.targeted, f"C{cand.index}T", targets, patch_id)
@@ -379,6 +394,7 @@ class FixSearch:
                                         [tid, f"{tid[:60]}-T", patch_id]))
             if not ok:
                 cand.status = "targeted_failed"
+                self._classify(cand, cand.targeted)
                 return
             cand.full = run_tests(box, select=self._full_select, timeout=self.test_timeout)
             fid = record(cand.full, f"C{cand.index}F", self._full_select, patch_id)
@@ -388,6 +404,22 @@ class FixSearch:
                                         "every collected test passed in the sandbox copy; does not show the code is "
                                         "correct or that the tests cover the bug", [fid, f"{fid[:60]}-T", patch_id]))
             cand.status = "passed" if ok else "full_failed"
+            self._classify(cand, cand.full)
+
+    def _classify(self, cand: Candidate, run: TestRun) -> None:
+        """Split a failed confirming run: original failures not fixed, or other tests broken.
+        A run that produced no per-test results (crash, time-out) leaves both unknown."""
+        if not run.tests:
+            return
+        # A targeted run reports ids as selected ("tests.test_x.Case.test"), a discovery run
+        # relative to the start directory ("test_x.Case.test"): compare without that prefix.
+        def key(test_id: str) -> str:
+            head, _, rest = test_id.partition(".")
+            return rest if head in ("tests", "test") and rest else test_id
+        now = {key(t.id) for t in run.tests if t.outcome in ("failed", "error")}
+        before = {key(i) for i in getattr(self, "_baseline_failing", set())}
+        cand.still_failing = sorted(now & before)
+        cand.new_failures = sorted(now - before)
 
     def _scope_name(self) -> str:
         if not self._full_select:
