@@ -483,6 +483,38 @@ class Building(unittest.TestCase):
                                        clock=lambda: t[0]))
         self.assertTrue(bb.wait_ready(object(), 30))
 
+    def test_scratch_folder_holds_every_copy(self):
+        import tempfile as tf
+        bench = self.root / "bench"
+        self.build(bench)
+        scratch = self.root / "scratch"
+        seen = []
+
+        class Peek:
+            model = "peek"
+
+            def chat(self, *args, **kwargs):
+                seen.append(tf.gettempdir())
+                return Completion("no", 0.1, 1, 1, None)
+
+        before = tf.gettempdir()
+        bb.run("dev", model=Peek(), backend_factory=dev, candidates=1, out_path=self.root / "s.jsonl", out_dir=bench,
+               root=self.root, log=lambda *a: None, scratch=scratch)
+        self.assertEqual(seen, [str(scratch.resolve())])
+        self.assertEqual(tf.gettempdir(), before)                         # restored afterwards
+        self.assertTrue(scratch.is_dir())
+
+    def test_suspended_mutants_are_left_out_of_time_figures(self):
+        base = {"repo": "r", "operator": "o", "status": "ok", "solved": True, "exact_restore": True, "model_calls": 1}
+        rows = [dict(base, id="a", model_seconds=100.0, total_seconds=200.0),
+                dict(base, id="b", model_seconds=150.0, total_seconds=300.0),
+                dict(base, id="slept", model_seconds=80000.0, total_seconds=81969.3)]
+        out = bb.summarize(rows)
+        self.assertEqual(out["overall"]["solved"], 3)                     # results still count
+        self.assertEqual(out["time_outliers"], ["slept"])
+        self.assertEqual(out["time_without_outliers"]["total_seconds"], 500.0)
+        self.assertEqual(out["time_without_outliers"]["median_seconds_per_mutant"], 300.0)
+
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
         lo, hi = bb.wilson(5, 10)

@@ -58,6 +58,7 @@ DEFAULT_TARGETS = {"noema": 160, "more_itertools": 160}
 MAX_MODULES = 3                   # a function mentioned by more test modules is too generic to target
 MAX_SCOPE_SECONDS = 20.0          # test scopes slower than this on the base are skipped
 MAX_PER_FUNCTION = 2
+SUSPECT_SECONDS = 4 * 3600        # one mutant: at most 4 candidates x 900 s model timeout, plus tests
 
 
 @dataclass(frozen=True)
@@ -428,7 +429,32 @@ def wait_ready(model, max_wait: float, log=print, sleep=time.sleep, clock=time.m
 def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int | None = None, out_path: Path,
         out_dir: Path = BENCH_DIR, root: Path = Path("."), allow_eval: bool = False, audit_dir: Path | None = None,
         max_output_tokens: int = 1024, ids: list[str] | None = None, log=print, search_factory=None,
-        resume: bool = False, redo: list[str] | None = None, ready_wait: float = 900) -> dict:
+        resume: bool = False, redo: list[str] | None = None, ready_wait: float = 900,
+        scratch: Path | None = None) -> dict:
+    """``scratch``: a folder for every temporary copy this run makes (base copies, work copies,
+    sandboxes, indexes) instead of the system temp folder, which Windows may clean up during a
+    long run (laptop, 2026-11-15 and 2026-11-20: files vanished from copies in %TEMP%)."""
+    if scratch is None:
+        return _run(split, model=model, backend_factory=backend_factory, candidates=candidates, limit=limit,
+                    out_path=out_path, out_dir=out_dir, root=root, allow_eval=allow_eval, audit_dir=audit_dir,
+                    max_output_tokens=max_output_tokens, ids=ids, log=log, search_factory=search_factory,
+                    resume=resume, redo=redo, ready_wait=ready_wait)
+    scratch = Path(scratch).resolve()
+    scratch.mkdir(parents=True, exist_ok=True)
+    previous = tempfile.tempdir
+    tempfile.tempdir = str(scratch)
+    try:
+        return _run(split, model=model, backend_factory=backend_factory, candidates=candidates, limit=limit,
+                    out_path=out_path, out_dir=out_dir, root=root, allow_eval=allow_eval, audit_dir=audit_dir,
+                    max_output_tokens=max_output_tokens, ids=ids, log=log, search_factory=search_factory,
+                    resume=resume, redo=redo, ready_wait=ready_wait)
+    finally:
+        tempfile.tempdir = previous
+
+
+def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path: Path, out_dir: Path, root: Path,
+         allow_eval: bool, audit_dir, max_output_tokens: int, ids, log, search_factory, resume: bool, redo,
+         ready_wait: float) -> dict:
     from .contract import request_from_dict
     from .fix_search import FixSearch
     if split == "eval" and not allow_eval:
@@ -620,6 +646,17 @@ def summarize(rows: list[dict]) -> dict:
            "model_calls": sum(r["model_calls"] for r in rows),
            "model_seconds": round(sum(r["model_seconds"] for r in rows), 1),
            "total_seconds": round(sum(r["total_seconds"] for r in rows), 1)}
+    # Wall time includes any time the machine was suspended (laptop: single mutants of 19-25 h).
+    # Rows over SUSPECT_SECONDS are listed and left out of the time figures; results still count.
+    timed = [r for r in rows if r["total_seconds"] <= SUSPECT_SECONDS]
+    out["time_outliers"] = sorted(r["id"] for r in rows if r["total_seconds"] > SUSPECT_SECONDS)
+    seconds = sorted(r["total_seconds"] for r in timed)
+    out["time_without_outliers"] = {
+        "mutants": len(timed),
+        "model_seconds": round(sum(r["model_seconds"] for r in timed), 1),
+        "total_seconds": round(sum(seconds), 1),
+        "median_seconds_per_mutant": round(seconds[len(seconds) // 2], 1) if seconds else None,
+        "model_calls": sum(r["model_calls"] for r in timed)}
     for key, name in (("repo", "by_repo"), ("operator", "by_operator")):
         for value in sorted({r[key] for r in rows}):
             out[name][value] = block([r for r in rows if r[key] == value])
@@ -644,6 +681,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--limit", type=int)
     r.add_argument("--ids", nargs="*")
     r.add_argument("--redo", nargs="*", metavar="ID", help="with --resume: run these mutants again")
+    r.add_argument("--scratch", metavar="DIR",
+                   help="folder for temporary copies instead of the system temp folder (Windows may clean that)")
     r.add_argument("--resume", action="store_true",
                    help="keep the mutants already in --out (dev only); retry those a model error cut short")
     r.add_argument("-n", "--candidates", type=int, default=4)
@@ -699,6 +738,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = run(args.split, model=LazyLocalModel(args.model_url, expectation=expectation, timeout=args.model_timeout),
                   backend_factory=factory,
                   candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out), resume=args.resume, redo=args.redo,
+                  scratch=Path(args.scratch) if args.scratch else None,
                   allow_eval=args.allow_eval, audit_dir=Path(args.audit) if args.audit else None,
                   max_output_tokens=args.max_output_tokens)
     print(json.dumps(summary, indent=2))
