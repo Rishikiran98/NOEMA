@@ -430,7 +430,7 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         out_dir: Path = BENCH_DIR, root: Path = Path("."), allow_eval: bool = False, audit_dir: Path | None = None,
         max_output_tokens: int = 1024, ids: list[str] | None = None, log=print, search_factory=None,
         resume: bool = False, redo: list[str] | None = None, ready_wait: float = 900,
-        scratch: Path | None = None) -> dict:
+        scratch: Path | None = None, max_wall_seconds: float = 600.0) -> dict:
     """``scratch``: a folder for every temporary copy this run makes (base copies, work copies,
     sandboxes, indexes) instead of the system temp folder, which Windows may clean up during a
     long run (laptop, 2026-11-15 and 2026-11-20: files vanished from copies in %TEMP%)."""
@@ -438,7 +438,7 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         return _run(split, model=model, backend_factory=backend_factory, candidates=candidates, limit=limit,
                     out_path=out_path, out_dir=out_dir, root=root, allow_eval=allow_eval, audit_dir=audit_dir,
                     max_output_tokens=max_output_tokens, ids=ids, log=log, search_factory=search_factory,
-                    resume=resume, redo=redo, ready_wait=ready_wait)
+                    resume=resume, redo=redo, ready_wait=ready_wait, max_wall_seconds=max_wall_seconds)
     scratch = Path(scratch).resolve()
     scratch.mkdir(parents=True, exist_ok=True)
     previous = tempfile.tempdir
@@ -447,14 +447,14 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         return _run(split, model=model, backend_factory=backend_factory, candidates=candidates, limit=limit,
                     out_path=out_path, out_dir=out_dir, root=root, allow_eval=allow_eval, audit_dir=audit_dir,
                     max_output_tokens=max_output_tokens, ids=ids, log=log, search_factory=search_factory,
-                    resume=resume, redo=redo, ready_wait=ready_wait)
+                    resume=resume, redo=redo, ready_wait=ready_wait, max_wall_seconds=max_wall_seconds)
     finally:
         tempfile.tempdir = previous
 
 
 def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path: Path, out_dir: Path, root: Path,
          allow_eval: bool, audit_dir, max_output_tokens: int, ids, log, search_factory, resume: bool, redo,
-         ready_wait: float) -> dict:
+         ready_wait: float, max_wall_seconds: float = 600.0) -> dict:
     from .contract import request_from_dict
     from .fix_search import FixSearch
     if split == "eval" and not allow_eval:
@@ -516,7 +516,8 @@ def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path
             request = request_from_dict({"question": f"Make the failing tests in {m['repo']} pass",
                                          "task": "repo_fix", "repo": {"path": str(work)}, "allow_execution": True,
                                          "client_request_id": m["id"],
-                                         "budget": {"max_model_calls": candidates, "max_output_tokens": max_output_tokens}})
+                                         "budget": {"max_model_calls": candidates, "max_output_tokens": max_output_tokens,
+                                                    "max_wall_seconds": max_wall_seconds}})
             search = (search_factory or (lambda: FixSearch(model, backend_factory, candidates=candidates)))()
             started = time.perf_counter()
             try:
@@ -577,7 +578,11 @@ def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path
                     "Invoke-WebRequest http://127.0.0.1:8080/health; a 503 'Loading model' means wait)")
                 break
     summary = summarize(rows)
-    summary.update(split=split, manifest_sha256=manifest["sha256"], candidates=candidates, results=str(out_path))
+    # The per-mutant wall-time budget caps how many candidates actually run (the contract's
+    # default is 600 s; the first dev run used it without saying so).
+    summary.update(split=split, manifest_sha256=manifest["sha256"], candidates=candidates, results=str(out_path),
+                   budget={"max_model_calls": candidates, "max_output_tokens": max_output_tokens,
+                           "max_wall_seconds": max_wall_seconds})
     if split == "eval":
         summary["eval_run_number"] = log_eval_run({"utc": datetime.now(timezone.utc).isoformat(), **summary}, out_dir)
     return summary
@@ -689,6 +694,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--model-url", default="http://127.0.0.1:8080")
     r.add_argument("--expect-model")
     r.add_argument("--max-output-tokens", type=int, default=1024)
+    r.add_argument("--max-wall-seconds", type=float, default=600.0,
+                   help="per-mutant wall-time budget; candidates not started before it runs out are skipped "
+                        "(600 s = the contract default, used by the first dev run)")
     r.add_argument("--model-timeout", type=int, default=900, help="seconds per model request")
     r.add_argument("--out", default="bugbench_results.jsonl")
     r.add_argument("--audit", metavar="DIR")
@@ -738,7 +746,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = run(args.split, model=LazyLocalModel(args.model_url, expectation=expectation, timeout=args.model_timeout),
                   backend_factory=factory,
                   candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out), resume=args.resume, redo=args.redo,
-                  scratch=Path(args.scratch) if args.scratch else None,
+                  scratch=Path(args.scratch) if args.scratch else None, max_wall_seconds=args.max_wall_seconds,
                   allow_eval=args.allow_eval, audit_dir=Path(args.audit) if args.audit else None,
                   max_output_tokens=args.max_output_tokens)
     print(json.dumps(summary, indent=2))

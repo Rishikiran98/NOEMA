@@ -515,6 +515,29 @@ class Building(unittest.TestCase):
         self.assertEqual(out["time_without_outliers"]["total_seconds"], 500.0)
         self.assertEqual(out["time_without_outliers"]["median_seconds_per_mutant"], 300.0)
 
+    def test_wall_time_budget_is_passed_and_recorded(self):
+        from cpu_platform.fix_search import FixSearch
+        bench = self.root / "bench"
+        self.build(bench)
+        budgets = []
+
+        class Spy(FixSearch):
+            def run(self, request, repo, **kwargs):
+                budgets.append(request.budget.max_wall_seconds)
+                return super().run(request, repo, **kwargs)
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                return Completion("no", 0.1, 1, 1, None)
+
+        summary = bb.run("dev", model=Null(), backend_factory=dev, candidates=2, out_path=self.root / "b.jsonl",
+                         out_dir=bench, root=self.root, log=lambda *a: None, max_wall_seconds=3600,
+                         search_factory=lambda: Spy(Null(), dev, candidates=2))
+        self.assertEqual(set(budgets), {3600})
+        self.assertEqual(summary["budget"], {"max_model_calls": 2, "max_output_tokens": 1024, "max_wall_seconds": 3600})
+
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
         lo, hi = bb.wilson(5, 10)
