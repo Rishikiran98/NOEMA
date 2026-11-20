@@ -430,7 +430,8 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         out_dir: Path = BENCH_DIR, root: Path = Path("."), allow_eval: bool = False, audit_dir: Path | None = None,
         max_output_tokens: int = 1024, ids: list[str] | None = None, log=print, search_factory=None,
         resume: bool = False, redo: list[str] | None = None, ready_wait: float = 900,
-        scratch: Path | None = None, max_wall_seconds: float = 600.0) -> dict:
+        scratch: Path | None = None, max_wall_seconds: float = 600.0, feedback: bool = False,
+        sample: int | None = None, sample_seed: int = DEFAULT_SEED) -> dict:
     """``scratch``: a folder for every temporary copy this run makes (base copies, work copies,
     sandboxes, indexes) instead of the system temp folder, which Windows may clean up during a
     long run (laptop, 2026-11-15 and 2026-11-20: files vanished from copies in %TEMP%)."""
@@ -438,7 +439,8 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         return _run(split, model=model, backend_factory=backend_factory, candidates=candidates, limit=limit,
                     out_path=out_path, out_dir=out_dir, root=root, allow_eval=allow_eval, audit_dir=audit_dir,
                     max_output_tokens=max_output_tokens, ids=ids, log=log, search_factory=search_factory,
-                    resume=resume, redo=redo, ready_wait=ready_wait, max_wall_seconds=max_wall_seconds)
+                    resume=resume, redo=redo, ready_wait=ready_wait, max_wall_seconds=max_wall_seconds,
+                    feedback=feedback, sample=sample, sample_seed=sample_seed)
     scratch = Path(scratch).resolve()
     scratch.mkdir(parents=True, exist_ok=True)
     previous = tempfile.tempdir
@@ -447,14 +449,16 @@ def run(split: str, *, model, backend_factory, candidates: int = 4, limit: int |
         return _run(split, model=model, backend_factory=backend_factory, candidates=candidates, limit=limit,
                     out_path=out_path, out_dir=out_dir, root=root, allow_eval=allow_eval, audit_dir=audit_dir,
                     max_output_tokens=max_output_tokens, ids=ids, log=log, search_factory=search_factory,
-                    resume=resume, redo=redo, ready_wait=ready_wait, max_wall_seconds=max_wall_seconds)
+                    resume=resume, redo=redo, ready_wait=ready_wait, max_wall_seconds=max_wall_seconds,
+                    feedback=feedback, sample=sample, sample_seed=sample_seed)
     finally:
         tempfile.tempdir = previous
 
 
 def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path: Path, out_dir: Path, root: Path,
          allow_eval: bool, audit_dir, max_output_tokens: int, ids, log, search_factory, resume: bool, redo,
-         ready_wait: float, max_wall_seconds: float = 600.0) -> dict:
+         ready_wait: float, max_wall_seconds: float = 600.0, feedback: bool = False,
+         sample: int | None = None, sample_seed: int = DEFAULT_SEED) -> dict:
     from .contract import request_from_dict
     from .fix_search import FixSearch
     if split == "eval" and not allow_eval:
@@ -463,6 +467,8 @@ def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path
     manifest, mutants = load(split, out_dir)
     if ids:
         mutants = [m for m in mutants if m["id"] in set(ids)]
+    if sample:
+        mutants = sample_mutants(mutants, sample, sample_seed)
     if limit:
         mutants = mutants[:limit]
     rows = []
@@ -518,7 +524,8 @@ def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path
                                          "client_request_id": m["id"],
                                          "budget": {"max_model_calls": candidates, "max_output_tokens": max_output_tokens,
                                                     "max_wall_seconds": max_wall_seconds}})
-            search = (search_factory or (lambda: FixSearch(model, backend_factory, candidates=candidates)))()
+            search = (search_factory or (lambda: FixSearch(model, backend_factory, candidates=candidates,
+                                                           feedback=feedback)))()
             started = time.perf_counter()
             try:
                 result = search.run(request, work, select=m["test_scope"], full_select=m["test_scope"],
@@ -527,7 +534,8 @@ def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path
                         and wait_ready(model, ready_wait, log)):
                     # The server was (re)loading: once it is ready, try this mutant again, once.
                     log(f"  {m['id']}: the model server answered 503; it is ready now, retrying this mutant")
-                    search = (search_factory or (lambda: FixSearch(model, backend_factory, candidates=candidates)))()
+                    search = (search_factory or (lambda: FixSearch(model, backend_factory, candidates=candidates,
+                                                                   feedback=feedback)))()
                     started = time.perf_counter()
                     result = search.run(request, work, select=m["test_scope"], full_select=m["test_scope"],
                                         index_db=Path(tmp) / "index" / f"{m['id']}.sqlite")
@@ -582,7 +590,8 @@ def _run(split: str, *, model, backend_factory, candidates: int, limit, out_path
     # default is 600 s; the first dev run used it without saying so).
     summary.update(split=split, manifest_sha256=manifest["sha256"], candidates=candidates, results=str(out_path),
                    budget={"max_model_calls": candidates, "max_output_tokens": max_output_tokens,
-                           "max_wall_seconds": max_wall_seconds})
+                           "max_wall_seconds": max_wall_seconds},
+                   settings={"feedback": feedback, "sample": sample, "sample_seed": sample_seed if sample else None})
     if split == "eval":
         summary["eval_run_number"] = log_eval_run({"utc": datetime.now(timezone.utc).isoformat(), **summary}, out_dir)
     return summary
@@ -627,6 +636,67 @@ def failure_split(rows: list[dict]) -> dict:
             else:
                 out["no_detail"] += 1        # failed, but no failing test was reported (e.g. a crash)
     return {k: out.get(k, 0) for k in ("not_fixed", "broke_others", "both", "no_detail", "untargeted")}
+
+
+def sample_mutants(mutants: list[dict], n: int, seed: int) -> list[dict]:
+    """A seeded sample of n mutants, stratified by repository (proportional, at least one each),
+    in id order: the same n and seed always give the same mutants."""
+    by_repo = defaultdict(list)
+    for m in mutants:
+        by_repo[m["repo"]].append(m)
+    total = len(mutants)
+    picked = []
+    repos = sorted(by_repo)
+    n = min(n, total)
+    # Largest remainder: exactly n, proportional; every repository gets one when n allows it.
+    exact = {r: n * len(by_repo[r]) / total for r in repos}
+    quotas = {r: int(exact[r]) for r in repos}
+    if n >= len(repos):
+        for r in repos:
+            quotas[r] = max(quotas[r], 1)
+    for r in sorted(repos, key=lambda r: (-(exact[r] - int(exact[r])), r)):
+        if sum(quotas.values()) >= n:
+            break
+        if quotas[r] < len(by_repo[r]):
+            quotas[r] += 1
+    while sum(quotas.values()) > n:
+        quotas[max(repos, key=lambda r: (quotas[r], r))] -= 1
+    for r in repos:
+        pool = sorted(by_repo[r], key=lambda m: m["id"])
+        picked += random.Random(f"{seed}:sample:{r}").sample(pool, min(quotas[r], len(pool)))
+    return sorted(picked, key=lambda m: m["id"])
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar p-value for b and c discordant pairs (binomial, p = 0.5)."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n
+    return min(1.0, 2 * tail)
+
+
+def compare(rows_a: list[dict], rows_b: list[dict]) -> dict:
+    """Paired comparison of two runs on the mutants both scored (excluded or missing rows in
+    either run are left out). b = solved only by A, c = solved only by B."""
+    a = {r["id"]: r for r in rows_a if not excluded(r)}
+    b_rows = {r["id"]: r for r in rows_b if not excluded(r)}
+    common = sorted(set(a) & set(b_rows))
+    both = sum(1 for i in common if a[i]["solved"] and b_rows[i]["solved"])
+    only_a = sorted(i for i in common if a[i]["solved"] and not b_rows[i]["solved"])
+    only_b = sorted(i for i in common if b_rows[i]["solved"] and not a[i]["solved"])
+    neither = len(common) - both - len(only_a) - len(only_b)
+    solved_a, solved_b = both + len(only_a), both + len(only_b)
+    calls = lambda rows: sum(rows[i]["model_calls"] for i in common)   # noqa: E731
+    return {"paired": len(common), "solved_a": solved_a, "solved_b": solved_b,
+            "rate_a": round(solved_a / len(common), 3) if common else None,
+            "rate_b": round(solved_b / len(common), 3) if common else None,
+            "both": both, "neither": neither, "only_a": only_a, "only_b": only_b,
+            "mcnemar_exact_p": round(mcnemar_exact(len(only_a), len(only_b)), 4),
+            "model_calls_a": calls(a), "model_calls_b": calls(b_rows),
+            "left_out": sorted((set(a) | set(b_rows)) - set(common)),
+            "note": "paired on the same mutants; p tests whether A and B differ, not which settings are right"}
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -686,6 +756,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--limit", type=int)
     r.add_argument("--ids", nargs="*")
     r.add_argument("--redo", nargs="*", metavar="ID", help="with --resume: run these mutants again")
+    r.add_argument("--feedback", action="store_true",
+                   help="tell each candidate after the first what went wrong with the previous one")
+    r.add_argument("--sample", type=int, metavar="N", help="a seeded sample of N mutants of the split (stratified by repo)")
+    r.add_argument("--sample-seed", type=int, default=DEFAULT_SEED)
     r.add_argument("--scratch", metavar="DIR",
                    help="folder for temporary copies instead of the system temp folder (Windows may clean that)")
     r.add_argument("--resume", action="store_true",
@@ -704,11 +778,17 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="counts per repository, operator and split")
     sm = sub.add_parser("summarize", help="recompute the summary from a results file (also a partial one)")
     sm.add_argument("results")
+    cp = sub.add_parser("compare", help="paired comparison of two results files on the same mutants")
+    cp.add_argument("a")
+    cp.add_argument("b")
     for p in (b, c, r):
         p.add_argument("--backend", choices=("dev", "container"), default="container" if p is r else "dev")
         p.add_argument("--image")
         p.add_argument("--i-understand-dev-is-not-isolated", action="store_true", dest="ack")
     args = parser.parse_args(argv)
+    if args.command == "compare":
+        print(json.dumps(compare(read_jsonl(Path(args.a)), read_jsonl(Path(args.b))), indent=2))
+        return 0
     if args.command == "summarize":
         rows = read_jsonl(Path(args.results))
         out = summarize(rows)
@@ -747,6 +827,7 @@ def main(argv: list[str] | None = None) -> int:
                   backend_factory=factory,
                   candidates=args.candidates, limit=args.limit, ids=args.ids, out_path=Path(args.out), resume=args.resume, redo=args.redo,
                   scratch=Path(args.scratch) if args.scratch else None, max_wall_seconds=args.max_wall_seconds,
+                  feedback=args.feedback, sample=args.sample, sample_seed=args.sample_seed,
                   allow_eval=args.allow_eval, audit_dir=Path(args.audit) if args.audit else None,
                   max_output_tokens=args.max_output_tokens)
     print(json.dumps(summary, indent=2))

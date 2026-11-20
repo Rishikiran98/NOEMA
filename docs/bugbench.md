@@ -102,6 +102,33 @@ it if anything is missing or changed (`base_repaired`).
 test can admit one that is not really caught (`nm-042093970d`). Such mutants report
 `not_caught_here` and are not scored. The next build should confirm each catch twice.
 
+## Tuning on dev
+
+A full dev run takes about 17 hours on the laptop, so tuning uses a **seeded sample of dev**.
+`--sample 40` gives 40 mutants, stratified by repository (24 more-itertools, 16 NOEMA with the
+default seed). The same sample comes back every time. Each setting is compared with another on
+the same mutants:
+
+```powershell
+py -m cpu_platform.bugbench compare bugbench_dev_all.jsonl tune_budget.jsonl
+```
+
+`compare` pairs the two files on the mutants both scored. It reports both rates, which mutants
+only A or only B solved, an exact McNemar p-value, and the model calls of each run. Settings
+are recorded in each run's summary (`budget`, `settings`).
+
+| Switch | What it changes |
+|---|---|
+| `--max-wall-seconds S` | per-mutant wall budget (the first dev run used the default 600 s, often fewer than 4 candidates) |
+| `--feedback` | each candidate after the first is told what went wrong with the previous one: no diff, the policy rejected it, it did not apply (copy the context exactly), or which tests still failed, with their output and the failed diff. Test output and the model's own diff are neutralized as untrusted data |
+
+Each row also keeps what the model wrote when a candidate never reached the tests
+(`answer_excerpt`), for studying format failures.
+
+A sample of 40 cannot show small differences: a paired test needs many discordant mutants.
+Use the sample to pick a direction; confirm a choice on the full dev split before freezing
+settings for the one eval run (M4.3).
+
 ## What a solved mutant does NOT show
 
 - The tests in scope pass, nothing more. A patch can pass without restoring the original

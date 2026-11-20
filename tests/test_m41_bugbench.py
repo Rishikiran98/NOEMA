@@ -538,6 +538,54 @@ class Building(unittest.TestCase):
         self.assertEqual(set(budgets), {3600})
         self.assertEqual(summary["budget"], {"max_model_calls": 2, "max_output_tokens": 1024, "max_wall_seconds": 3600})
 
+    def test_sample_is_seeded_and_stratified(self):
+        mutants = [{"id": f"a{n:02d}", "repo": "a"} for n in range(30)] + [{"id": f"b{n:02d}", "repo": "b"} for n in range(10)]
+        one = bb.sample_mutants(mutants, 8, 5)
+        self.assertEqual(one, bb.sample_mutants(mutants, 8, 5))
+        self.assertNotEqual([m["id"] for m in one], [m["id"] for m in bb.sample_mutants(mutants, 8, 6)])
+        self.assertEqual(Counter(m["repo"] for m in one), {"a": 6, "b": 2})
+        self.assertEqual(len(bb.sample_mutants(mutants, 1, 5)), 1)
+
+    def test_mcnemar_and_compare(self):
+        self.assertEqual(bb.mcnemar_exact(0, 0), 1.0)
+        self.assertAlmostEqual(bb.mcnemar_exact(0, 5), 0.0625)
+        self.assertAlmostEqual(bb.mcnemar_exact(3, 3), 1.0)
+        self.assertAlmostEqual(bb.mcnemar_exact(1, 9), 0.0215, places=4)
+        def row(i, solved, **extra):
+            return {"id": i, "solved": solved, "model_calls": 1, **extra}
+        a = [row("x", True), row("y", False), row("z", False), row("w", True), row("gone", False, error="baseline_failed")]
+        b = [row("x", True), row("y", True), row("z", False), row("w", False), row("gone", True)]
+        out = bb.compare(a, b)
+        self.assertEqual((out["paired"], out["solved_a"], out["solved_b"]), (4, 2, 2))
+        self.assertEqual((out["only_a"], out["only_b"], out["both"], out["neither"]), (["w"], ["y"], 1, 1))
+        self.assertEqual(out["left_out"], ["gone"])
+
+    def test_run_passes_feedback_and_sample_and_records_them(self):
+        from cpu_platform.fix_search import FixSearch
+        bench = self.root / "bench"
+        self.build(bench)
+        seen = []
+
+        class Null:
+            model = "null"
+
+            def chat(self, *args, **kwargs):
+                return Completion("no", 0.1, 1, 1, None)
+
+        original = FixSearch.__init__
+
+        def spy(self, *args, **kwargs):
+            seen.append(kwargs.get("feedback"))
+            original(self, *args, **kwargs)
+
+        import unittest.mock as mock
+        with mock.patch.object(FixSearch, "__init__", spy):
+            summary = bb.run("dev", model=Null(), backend_factory=dev, candidates=1, out_path=self.root / "f.jsonl",
+                             out_dir=bench, root=self.root, log=lambda *a: None, feedback=True, sample=1, sample_seed=3)
+        self.assertEqual(seen, [True])
+        self.assertEqual(summary["settings"], {"feedback": True, "sample": 1, "sample_seed": 3})
+        self.assertEqual(summary["overall"]["attempted"], 1)
+
     def test_wilson_interval(self):
         self.assertEqual(bb.wilson(0, 0), (0.0, 1.0))
         lo, hi = bb.wilson(5, 10)

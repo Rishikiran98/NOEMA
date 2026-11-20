@@ -94,6 +94,7 @@ for the terminal).
 
 * M3.5's acceptance is the matched-cost comparison against a single attempt, which runs in M4.3.
   M3.5 stays unticked until then.
-* No feedback loop: a failed candidate's test output is not fed into the next attempt
-  (candidates are independent samples).
+* Feedback is off by default: candidates are independent samples. `FixSearch(feedback=True)`
+  (`bugbench run --feedback`) gives each candidate after the first what went wrong with the
+  previous one (M4 tuning, 2026-11-20; effect measured on dev, see [bugbench.md](bugbench.md)).
 * Duplicate candidates are not removed; Python repositories only.
